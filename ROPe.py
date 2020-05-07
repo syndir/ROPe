@@ -439,7 +439,7 @@ def build_syscall_mprotect(f):
     xor_rax_rax = find_xor_rax_rax_ret() # rax = 0
     add_rax_1 = find_add_rax_1_ret()     # used to increment rax to the correct syscall number
 
-    if syscall is None or pop_rax is None or pop_rdi is None or pop_rsi is None or pop_r12_pr is None or mov_rdx_r12_ppr is None or xor_rax_rax is None or add_rax_1 is None:
+    if syscall is None or pop_rax is None or pop_rdi is None or pop_rsi is None or pop_r12_pr is None or (mov_rdx_r12_ppr is None and pop_rdx is None) or xor_rax_rax is None or add_rax_1 is None:
         print(f"{Colors.BOLD}{Colors.RED}Insufficient gadgets found for this chain!{Colors.GREY}{Colors.RESET}")
         return None
 
@@ -576,7 +576,7 @@ def build_libc_mprotect(f):
     xor_rax_rax = find_xor_rax_rax_ret() # rax = 0
     add_rax_1 = find_add_rax_1_ret()     # used to increment rax to the correct syscall number
 
-    if syscall is None or pop_rax is None or pop_rdi is None or pop_rsi is None or pop_r12_pr is None or mov_rdx_r12_ppr is None or xor_rax_rax is None or add_rax_1 is None:
+    if syscall is None or pop_rax is None or pop_rdi is None or pop_rsi is None or pop_r12_pr is None or (mov_rdx_r12_ppr is None and pop_rdx is None) or xor_rax_rax is None or add_rax_1 is None:
         print(f"{Colors.BOLD}{Colors.RED}Insufficient gadgets found for this chain!{Colors.GREY}{Colors.RESET}")
         return None
 
