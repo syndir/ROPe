@@ -1,5 +1,5 @@
 CC := gcc
-CFLAGS := -g -fno-stack-protector
+CFLAGS := -g -fno-stack-protector 
 
 .PHONY: clean all
 

