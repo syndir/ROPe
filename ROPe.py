@@ -1060,7 +1060,8 @@ def ROPe():
     parser = argparse.ArgumentParser(
             formatter_class = argparse.RawDescriptionHelpFormatter,
             description=('''\
-Automatically generate a ROP chain suitable for executing a third party payload.
+Automatically generate and execute a ROP chain suitable for executing a second
+stage shellcode.
 
 Four possible ROP chains are provided. By default, this tool will attempt to
 build and execute each of them in sequence. You may specify a particular target
