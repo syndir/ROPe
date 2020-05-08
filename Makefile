@@ -3,7 +3,7 @@ CFLAGS := -g -fno-stack-protector
 
 .PHONY: clean all
 
-all: vuln vuln2 notvuln
+all: vuln vuln2 notvuln poc
 	sudo sh -c "/bin/echo 0 > /proc/sys/kernel/randomize_va_space"
 
 vuln: vuln.o
@@ -21,5 +21,9 @@ notvuln: notvuln.o
 	sudo chown root:root notvuln
 	sudo chmod +s notvuln
 
+poc:
+	sh ./poc.sh
+
 clean:
 	sudo rm -rf vuln vuln.o vuln2 vuln2.o notvuln.o notvuln *.ROPe
+	sudo rm -rf libpoc.so poc poc.o

