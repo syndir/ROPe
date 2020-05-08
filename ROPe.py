@@ -15,7 +15,6 @@ import argparse
 import struct
 from subprocess import *
 import re
-import binascii
 from capstone import *
 from pwn import *
 
@@ -89,7 +88,7 @@ def find_buffer_length(f):
 
         proc = subprocess.Popen([f], stdin=PIPE, stdout=PIPE, stderr=STDOUT)
         try:
-            stdout = proc.communicate(input=bytes(buf.encode('ascii')))
+            stdout = proc.communicate(timeout=5, input=bytes(buf.encode('ascii')))
         except TimeoutExpired:
             proc.kill()
 
