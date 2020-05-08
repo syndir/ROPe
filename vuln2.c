@@ -13,6 +13,6 @@ int main(int argc, char *argv[])
 {
 	char buf[999];
 	foo();
-	gets(buf);
+	scanf("%s", buf);
 	return 0;
 }
