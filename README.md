@@ -1,8 +1,6 @@
 # ROPe
 ## Return Oriented Payload executor
 
----
-
 ROPe is a command line utility which can be used to generate and execute a ROP chain with the goal being the execution of a second-stage shellcode.
 
 ROPe was developed on Kali Linux 2020.1 x64 and requires Python >= 3.6.
