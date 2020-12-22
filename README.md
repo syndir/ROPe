@@ -1,10 +1,6 @@
 # ROPe
 ## Return Oriented Payload executor
 
-Stony Brook University  
-CSE 363  
-Daniel Calabria  
-
 ---
 
 ROPe is a command line utility which can be used to generate and execute a ROP chain with the goal being the execution of a second-stage shellcode.
