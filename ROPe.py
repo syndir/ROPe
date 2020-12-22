@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 #
-# Daniel Calabria
-# 103406017
-# CSE 363 Project
-#
 # ROPe.py
 # Return Oriented Programming executor.
 #
